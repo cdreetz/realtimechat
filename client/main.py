@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AudioProcessor:
-    def __init__(self, sample_rate=44100, channels=1, dtype=np.float32):
+    def __init__(self, sample_rate=16000, channels=1, dtype=np.float32):
         self.sample_rate = sample_rate
         self.channels = channels
         self.dtype = dtype
@@ -41,21 +41,17 @@ class AudioProcessor:
     def start_recording(self):
         self.is_recording = True
         
-        # Use device 1 (MacBook Pro Microphone) explicitly
         device_info = sd.query_devices(1, 'input')
         logger.info(f"Using input device: {device_info}")
         
-        # Use the device's native sample rate
-        native_sample_rate = int(device_info['default_samplerate'])
-        logger.info(f"Using native sample rate: {native_sample_rate}")
-        
+        # Force 16kHz sample rate for speech recognition
         self.stream = sd.InputStream(
-            device=1,  # Explicitly use MacBook Pro Microphone
+            device=1,
             channels=self.channels,
-            samplerate=native_sample_rate,
+            samplerate=16000,  # Force 16kHz
             dtype=self.dtype,
             callback=self.audio_callback,
-            blocksize=1024  # Add explicit blocksize
+            blocksize=1024
         )
         self.stream.start()
         logger.info("Audio stream started")
@@ -191,19 +187,20 @@ class SpeechClient:
     async def process_audio(self):
         chunks = []
         total_frames = 0
-        target_frames = self.audio_processor.sample_rate * 2  # 2 seconds of audio
+        target_frames = self.sample_rate * 0.5  # Reduced to 0.5 seconds chunks
         
         while self.running:
             try:
                 chunk = self.audio_processor.get_audio_chunk()
                 
                 if chunk is not None:
+                    # Amplify the audio signal
+                    chunk = chunk * 5.0  # Increase volume
                     chunks.append(chunk)
                     total_frames += len(chunk)
                     
                     if total_frames >= target_frames:
                         audio_data = np.concatenate(chunks)
-                        # Add debug logging
                         logger.info(f"Sending audio chunk: shape={audio_data.shape}, dtype={audio_data.dtype}, "
                                   f"min={audio_data.min():.3f}, max={audio_data.max():.3f}")
                         await self.send_audio(audio_data)
