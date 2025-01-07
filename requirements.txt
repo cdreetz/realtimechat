@@ -1,7 +1,9 @@
+accelerate==1.2.1
 annotated-types==0.7.0
 anyio==4.8.0
 asitop==0.0.24
 asyncio==3.4.3
+bitsandbytes==0.42.0
 blessed==1.20.0
 certifi==2024.12.14
 cffi==1.17.1
@@ -32,6 +34,7 @@ PyYAML==6.0.2
 regex==2024.11.6
 requests==2.32.3
 safetensors==0.5.1
+scipy==1.15.0
 sentencepiece==0.2.0
 setuptools==70.2.0
 six==1.17.0

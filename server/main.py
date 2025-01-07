@@ -8,10 +8,9 @@ from transformers import (
     WhisperForConditionalGeneration,
     AutoModelForCausalLM,
     AutoTokenizer,
-    SpeechT5Processor, 
-    SpeechT5ForTextToSpeech,
-    SpeechT5HifiGan
 )
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
 import io
 import json
 import uvicorn
@@ -92,24 +91,17 @@ class SpeechServer:
             low_cpu_mem_usage=True,
         )
 
-        print("Loading SpeechT5 models...")
+        print("Loading XTTS model...")
         torch.cuda.empty_cache()
-        self.tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
-        self.tts_model = SpeechT5ForTextToSpeech.from_pretrained(
-            "microsoft/speecht5_tts",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
-        
-        torch.cuda.empty_cache()
-        self.vocoder = SpeechT5HifiGan.from_pretrained(
-            "microsoft/speecht5_hifigan",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        self.tts_config = XttsConfig()
+        self.tts_config.load_json("path/to/xtts/config.json")  # Update with your config path
+        self.tts_model = Xtts.init_from_config(self.tts_config)
+        self.tts_model.load_checkpoint(self.tts_config, checkpoint_dir="path/to/xtts/", eval=True)  # Update with your checkpoint path
+        self.tts_model.cuda()
 
-        # Ensure speaker embedding is created with the right dtype
-        self.speaker_embedding = torch.randn(1, 512, dtype=torch.float16).to(self.device)
+        # Load a reference audio file for the voice
+        self.reference_audio = "path/to/reference.wav"  # Update with your reference audio path
+
         print("All models loaded successfully!")
 
     def setup_routes(self):
@@ -205,7 +197,7 @@ class SpeechServer:
         chunks = []
         current_chunk = []
         current_length = 0
-        max_chunk_length = 100  # Adjust based on testing
+        max_chunk_length = 100
         
         for sentence in sentences:
             sentence = sentence.strip() + '.'  # Add back the period
@@ -226,33 +218,24 @@ class SpeechServer:
         
         # Process and stream each chunk
         for i, chunk in enumerate(chunks):
-            inputs = self.tts_processor(
-                text=chunk,
-                return_tensors="pt",
+            # Generate speech using XTTS
+            speech = self.tts_model.synthesize(
+                chunk,
+                self.tts_config,
+                speaker_wav=self.reference_audio,
+                gpt_cond_len=3,
+                language="en"
             )
             
-            inputs = {
-                "input_ids": inputs["input_ids"].to(self.device),
-                "attention_mask": inputs["attention_mask"].to(self.device)
-            }
-            
-            speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
-            
-            speech = self.tts_model.generate_speech(
-                inputs["input_ids"],
-                speaker_embedding,
-                vocoder=self.vocoder
-            )
-            
-            # Convert to float32 for saving
-            speech = speech.to(dtype=torch.float32)
+            # Convert to tensor and prepare for saving
+            speech_tensor = torch.tensor(speech, dtype=torch.float32).unsqueeze(0)
             
             # Save this chunk to buffer
             buffer = io.BytesIO()
             torchaudio.save(
                 buffer,
-                speech.cpu().unsqueeze(0),
-                sample_rate=16000,
+                speech_tensor,
+                sample_rate=24000,  # XTTS uses 24kHz
                 format="wav"
             )
             
