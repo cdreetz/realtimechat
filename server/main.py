@@ -70,38 +70,42 @@ class SpeechServer:
         print("Loading models...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
-        torch.cuda.empty_cache()
 
-        # Speech detection and STT (Whisper)
+        # Load models one at a time with cache clearing
         print("Loading Whisper model...")
-        self.whisper_processor = WhisperProcessor.from_pretrained(
-            "openai/whisper-large-v3-turbo",
-            device_map="auto",
-            load_in_8bit=True
-        )
+        torch.cuda.empty_cache()
+        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
         self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
             "openai/whisper-large-v3-turbo",
             device_map="auto",
-            load_in_8bit=True
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
         )
 
-        # Text inference
         print("Loading Llama model...")
+        torch.cuda.empty_cache()
         self.chat_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
         self.chat_model = AutoModelForCausalLM.from_pretrained(
             "meta-llama/Llama-3.2-1B-Instruct",
             device_map="auto",
-            load_in_8bit=True
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
         )
 
-        # Text to Speech
         print("Loading SpeechT5 models...")
+        torch.cuda.empty_cache()
         self.tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
         self.tts_model = SpeechT5ForTextToSpeech.from_pretrained(
             "microsoft/speecht5_tts",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
         ).to(self.device)
+        
+        torch.cuda.empty_cache()
         self.vocoder = SpeechT5HifiGan.from_pretrained(
             "microsoft/speecht5_hifigan",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
         ).to(self.device)
 
         # Use a fixed speaker embedding for consistency
@@ -154,6 +158,9 @@ class SpeechServer:
             sampling_rate=16000, 
             return_tensors="pt"
         ).input_features.to(self.device)
+        
+        # Cast input to float16
+        input_features = input_features.to(torch.float16)
         
         predicted_ids = self.whisper_model.generate(input_features)
         transcription = self.whisper_processor.batch_decode(
