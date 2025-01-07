@@ -70,16 +70,29 @@ class SpeechServer:
         print("Loading models...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+        torch.cuda.empty_cache()
 
         # Speech detection and STT (Whisper)
         print("Loading Whisper model...")
-        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
-        self.whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo").to(self.device)
+        self.whisper_processor = WhisperProcessor.from_pretrained(
+            "openai/whisper-large-v3-turbo",
+            device_map="auto",
+            load_in_8bit=True
+        )
+        self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
+            "openai/whisper-large-v3-turbo",
+            device_map="auto",
+            load_in_8bit=True
+        )
 
         # Text inference
         print("Loading Llama model...")
         self.chat_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-        self.chat_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct").to(self.device)
+        self.chat_model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.2-1B-Instruct",
+            device_map="auto",
+            load_in_8bit=True
+        )
 
         # Text to Speech
         print("Loading SpeechT5 models...")
