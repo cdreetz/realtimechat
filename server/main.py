@@ -200,9 +200,14 @@ class SpeechServer:
         return response
 
     async def text_to_speech(self, text: str) -> bytes:
-        # Convert inputs to float16 and ensure they're on the right device
+        # Process text input - keep input_ids as Long type
         inputs = self.tts_processor(text=text, return_tensors="pt")
-        inputs = {k: v.to(dtype=torch.float16, device=self.device) for k, v in inputs.items()}
+        
+        # Move to device while maintaining correct dtypes
+        inputs = {
+            "input_ids": inputs["input_ids"].to(self.device),  # Keep as Long
+            "attention_mask": inputs["attention_mask"].to(self.device)  # Keep as Long
+        }
         
         # Ensure speaker embedding is float16
         speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
