@@ -23,14 +23,28 @@ class AudioProcessor:
         self.dtype = dtype
         self.audio_queue = Queue()
         self.is_recording = False
-
+        
+        # Add this debug line to show available audio devices
+        logger.info("Available audio devices:")
+        logger.info(sd.query_devices())
+        
     def audio_callback(self, indata, frames, time, status):
         if status:
             logger.warning(f"Audio callback status: {status}")
+        # Add debug logging for audio levels
+        audio_level = np.max(np.abs(indata))
+        logger.debug(f"Audio level: {audio_level:.3f}")
         self.audio_queue.put(indata.copy())
 
     def start_recording(self):
         self.is_recording = True
+        # Add debug logging
+        logger.info(f"Starting audio recording with: rate={self.sample_rate}, channels={self.channels}")
+        
+        # Get default input device
+        device_info = sd.query_devices(kind='input')
+        logger.info(f"Using input device: {device_info}")
+        
         self.stream = sd.InputStream(
             channels=self.channels,
             samplerate=self.sample_rate,
@@ -38,6 +52,7 @@ class AudioProcessor:
             callback=self.audio_callback
         )
         self.stream.start()
+        logger.info("Audio stream started")
 
     def stop_recording(self):
         self.is_recording = False
@@ -119,7 +134,21 @@ class SpeechClient:
                 elif data["type"] == "chat_response":
                     logger.info(f"Assistant: {data['data']}")
                 
+                elif data["type"] == "audio_response_chunk":
+                    # Handle streaming audio chunk
+                    audio_bytes = base64.b64decode(data["data"])
+                    audio_data = io.BytesIO(audio_bytes)
+                    data, samplerate = sf.read(audio_data)
+                    sd.play(data, samplerate)
+                    sd.wait()  # Wait for this chunk to finish playing
+                    
+                    # Log progress if desired
+                    chunk_num = data.get("chunk", 0)
+                    total_chunks = data.get("total_chunks", 1)
+                    logger.debug(f"Played audio chunk {chunk_num + 1}/{total_chunks}")
+                
                 elif data["type"] == "audio_response":
+                    # Keep old handler for backward compatibility
                     audio_bytes = base64.b64decode(data["data"])
                     audio_data = io.BytesIO(audio_bytes)
                     data, samplerate = sf.read(audio_data)
