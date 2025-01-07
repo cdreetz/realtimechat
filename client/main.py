@@ -17,39 +17,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class AudioProcessor:
-    def __init__(self, sample_rate=16000, channels=1, dtype=np.float32):
+    def __init__(self, sample_rate=44100, channels=1, dtype=np.float32):
         self.sample_rate = sample_rate
         self.channels = channels
         self.dtype = dtype
         self.audio_queue = Queue()
         self.is_recording = False
         
-        # Add this debug line to show available audio devices
         logger.info("Available audio devices:")
         logger.info(sd.query_devices())
         
     def audio_callback(self, indata, frames, time, status):
         if status:
             logger.warning(f"Audio callback status: {status}")
-        # Add debug logging for audio levels
+        
+        # More verbose audio level logging
         audio_level = np.max(np.abs(indata))
-        logger.debug(f"Audio level: {audio_level:.3f}")
+        if audio_level > 0.01:  # Only log when there's significant audio
+            logger.info(f"Audio detected! Level: {audio_level:.3f}")
+        
         self.audio_queue.put(indata.copy())
 
     def start_recording(self):
         self.is_recording = True
-        # Add debug logging
-        logger.info(f"Starting audio recording with: rate={self.sample_rate}, channels={self.channels}")
         
-        # Get default input device
-        device_info = sd.query_devices(kind='input')
+        # Use device 1 (MacBook Pro Microphone) explicitly
+        device_info = sd.query_devices(1, 'input')
         logger.info(f"Using input device: {device_info}")
         
+        # Use the device's native sample rate
+        native_sample_rate = int(device_info['default_samplerate'])
+        logger.info(f"Using native sample rate: {native_sample_rate}")
+        
         self.stream = sd.InputStream(
+            device=1,  # Explicitly use MacBook Pro Microphone
             channels=self.channels,
-            samplerate=self.sample_rate,
+            samplerate=native_sample_rate,
             dtype=self.dtype,
-            callback=self.audio_callback
+            callback=self.audio_callback,
+            blocksize=1024  # Add explicit blocksize
         )
         self.stream.start()
         logger.info("Audio stream started")
@@ -105,11 +111,24 @@ class SpeechClient:
             return False
 
     async def send_audio(self, audio_data):
+        # Ensure audio data is in float32 format and normalized
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+        
+        # Ensure audio is normalized between -1 and 1
+        if np.max(np.abs(audio_data)) > 1.0:
+            audio_data = audio_data / np.max(np.abs(audio_data))
+        
         message = {
             "type": "audio",
-            "data": base64.b64encode(audio_data.tobytes()).decode()
+            "data": base64.b64encode(audio_data.tobytes()).decode(),
+            "sample_rate": self.audio_processor.sample_rate,
+            "channels": self.audio_processor.channels
         }
-        return await self.send_message(message)
+        success = await self.send_message(message)
+        if success:
+            logger.debug("Audio chunk sent successfully")
+        return success
 
     async def send_text(self, text):
         message = {
@@ -127,6 +146,9 @@ class SpeechClient:
 
                 message = await self.websocket.recv()
                 data = json.loads(message)
+                
+                # Log all received messages for debugging
+                logger.debug(f"Received message type: {data['type']}")
                 
                 if data["type"] == "transcription":
                     logger.info(f"Transcription: {data['data']}")
@@ -181,6 +203,9 @@ class SpeechClient:
                     
                     if total_frames >= target_frames:
                         audio_data = np.concatenate(chunks)
+                        # Add debug logging
+                        logger.info(f"Sending audio chunk: shape={audio_data.shape}, dtype={audio_data.dtype}, "
+                                  f"min={audio_data.min():.3f}, max={audio_data.max():.3f}")
                         await self.send_audio(audio_data)
                         chunks = []
                         total_frames = 0

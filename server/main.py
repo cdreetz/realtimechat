@@ -199,36 +199,71 @@ class SpeechServer:
         logger.info(f"Generated response: {response}")
         return response
 
-    async def text_to_speech(self, text: str) -> bytes:
-        # Process text input - keep input_ids as Long type
-        inputs = self.tts_processor(text=text, return_tensors="pt")
+    async def text_to_speech(self, text: str, websocket: WebSocket) -> None:
+        # Split text into sentences and chunk them
+        sentences = text.split('.')
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        max_chunk_length = 100  # Adjust based on testing
         
-        # Move to device while maintaining correct dtypes
-        inputs = {
-            "input_ids": inputs["input_ids"].to(self.device),  # Keep as Long
-            "attention_mask": inputs["attention_mask"].to(self.device)  # Keep as Long
-        }
+        for sentence in sentences:
+            sentence = sentence.strip() + '.'  # Add back the period
+            if not sentence:
+                continue
+            
+            if current_length + len(sentence.split()) > max_chunk_length:
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                current_chunk = [sentence]
+                current_length = len(sentence.split())
+            else:
+                current_chunk.append(sentence)
+                current_length += len(sentence.split())
         
-        # Ensure speaker embedding is float16
-        speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
         
-        speech = self.tts_model.generate_speech(
-            inputs["input_ids"],
-            speaker_embedding,
-            vocoder=self.vocoder
-        )
-        
-        # Convert speech back to float32 for saving
-        speech = speech.to(dtype=torch.float32)
-        
-        buffer = io.BytesIO()
-        torchaudio.save(
-            buffer,
-            speech.cpu().unsqueeze(0),
-            sample_rate=16000,
-            format="wav"
-        )
-        return buffer.getvalue()
+        # Process and stream each chunk
+        for i, chunk in enumerate(chunks):
+            inputs = self.tts_processor(
+                text=chunk,
+                return_tensors="pt",
+            )
+            
+            inputs = {
+                "input_ids": inputs["input_ids"].to(self.device),
+                "attention_mask": inputs["attention_mask"].to(self.device)
+            }
+            
+            speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
+            
+            speech = self.tts_model.generate_speech(
+                inputs["input_ids"],
+                speaker_embedding,
+                vocoder=self.vocoder
+            )
+            
+            # Convert to float32 for saving
+            speech = speech.to(dtype=torch.float32)
+            
+            # Save this chunk to buffer
+            buffer = io.BytesIO()
+            torchaudio.save(
+                buffer,
+                speech.cpu().unsqueeze(0),
+                sample_rate=16000,
+                format="wav"
+            )
+            
+            # Send this chunk to the client
+            audio_b64 = base64.b64encode(buffer.getvalue()).decode()
+            await websocket.send_json({
+                "type": "audio_response_chunk",
+                "data": audio_b64,
+                "chunk": i,
+                "total_chunks": len(chunks)
+            })
 
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
         try:
@@ -274,14 +309,9 @@ class SpeechServer:
                     except Exception as e:
                         logger.error(f"Error sending chat response: {e}")
                     
-                    # Convert response to speech
+                    # Modified TTS section
                     try:
-                        audio_data = await self.text_to_speech(response)
-                        audio_b64 = base64.b64encode(audio_data).decode()
-                        await websocket.send_json({
-                            "type": "audio_response",
-                            "data": audio_b64
-                        })
+                        await self.text_to_speech(response, websocket)
                     except Exception as e:
                         logger.error(f"Error sending audio response: {e}")
                         return
@@ -294,12 +324,7 @@ class SpeechServer:
                     "data": response
                 })
                 
-                audio_data = await self.text_to_speech(response)
-                audio_b64 = base64.b64encode(audio_data).decode()
-                await websocket.send_json({
-                    "type": "audio_response",
-                    "data": audio_b64
-                })
+                await self.text_to_speech(response, websocket)
             
             else:
                 await websocket.send_json({
