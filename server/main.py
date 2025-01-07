@@ -318,4 +318,4 @@ class SpeechServer:
 
 if __name__ == "__main__":
     server = SpeechServer()
-    server.run()
+    server.run(host="0.0.0.0", port=8000)
