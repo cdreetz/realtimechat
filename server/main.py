@@ -235,16 +235,21 @@ class SpeechServer:
         # Process and stream each chunk
         for i, chunk in enumerate(chunks):
             try:
+                # Add error handling for empty or invalid chunks
+                if not chunk or len(chunk.strip()) == 0:
+                    logger.warning(f"Skipping empty chunk {i}")
+                    continue
+
                 # Generate speech using XTTS
                 speech = self.tts_model.synthesize(
-                    chunk,
-                    self.tts_config,
+                    text=chunk,  # Explicitly name the parameter
+                    config=self.tts_config,
                     speaker_wav=self.reference_audio,
                     gpt_cond_len=3,
                     language="en"
                 )
                 
-                if speech is None:  # Validate TTS output
+                if speech is None:
                     logger.error(f"TTS failed to generate audio for chunk: {chunk}")
                     continue
                     
@@ -256,7 +261,7 @@ class SpeechServer:
                 torchaudio.save(
                     buffer,
                     speech_tensor,
-                    sample_rate=24000,  # XTTS uses 24kHz
+                    sample_rate=24000,
                     format="wav"
                 )
                 
@@ -270,7 +275,7 @@ class SpeechServer:
                 })
                 
             except Exception as e:
-                logger.error(f"Error processing chunk {i}: {e}")
+                logger.error(f"Error processing chunk {i}: {str(e)}")
                 continue
 
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
