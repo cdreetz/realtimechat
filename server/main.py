@@ -197,6 +197,11 @@ class SpeechServer:
         return response
 
     async def text_to_speech(self, text: str, websocket: WebSocket) -> None:
+        # Validate input text
+        if not text or not isinstance(text, str):
+            logger.error(f"Invalid text input: {text}")
+            return
+
         # Split text into sentences and chunk them
         sentences = text.split('.')
         chunks = []
@@ -205,9 +210,11 @@ class SpeechServer:
         max_chunk_length = 100
         
         for sentence in sentences:
-            sentence = sentence.strip() + '.'  # Add back the period
-            if not sentence:
+            sentence = sentence.strip()
+            if not sentence:  # Skip empty sentences
                 continue
+            
+            sentence = sentence + '.'  # Add back the period
             
             if current_length + len(sentence.split()) > max_chunk_length:
                 if current_chunk:
@@ -218,40 +225,53 @@ class SpeechServer:
                 current_chunk.append(sentence)
                 current_length += len(sentence.split())
         
-        if current_chunk:
+        if current_chunk:  # Add the last chunk
             chunks.append(' '.join(current_chunk))
+        
+        if not chunks:  # If no valid chunks were created
+            logger.error("No valid text chunks to process")
+            return
         
         # Process and stream each chunk
         for i, chunk in enumerate(chunks):
-            # Generate speech using XTTS
-            speech = self.tts_model.synthesize(
-                chunk,
-                self.tts_config,
-                speaker_wav=self.reference_audio,
-                gpt_cond_len=3,
-                language="en"
-            )
-            
-            # Convert to tensor and prepare for saving
-            speech_tensor = torch.tensor(speech, dtype=torch.float32).unsqueeze(0)
-            
-            # Save this chunk to buffer
-            buffer = io.BytesIO()
-            torchaudio.save(
-                buffer,
-                speech_tensor,
-                sample_rate=24000,  # XTTS uses 24kHz
-                format="wav"
-            )
-            
-            # Send this chunk to the client
-            audio_b64 = base64.b64encode(buffer.getvalue()).decode()
-            await websocket.send_json({
-                "type": "audio_response_chunk",
-                "data": audio_b64,
-                "chunk": i,
-                "total_chunks": len(chunks)
-            })
+            try:
+                # Generate speech using XTTS
+                speech = self.tts_model.synthesize(
+                    chunk,
+                    self.tts_config,
+                    speaker_wav=self.reference_audio,
+                    gpt_cond_len=3,
+                    language="en"
+                )
+                
+                if speech is None:  # Validate TTS output
+                    logger.error(f"TTS failed to generate audio for chunk: {chunk}")
+                    continue
+                    
+                # Convert to tensor and prepare for saving
+                speech_tensor = torch.tensor(speech, dtype=torch.float32).unsqueeze(0)
+                
+                # Save this chunk to buffer
+                buffer = io.BytesIO()
+                torchaudio.save(
+                    buffer,
+                    speech_tensor,
+                    sample_rate=24000,  # XTTS uses 24kHz
+                    format="wav"
+                )
+                
+                # Send this chunk to the client
+                audio_b64 = base64.b64encode(buffer.getvalue()).decode()
+                await websocket.send_json({
+                    "type": "audio_response_chunk",
+                    "data": audio_b64,
+                    "chunk": i,
+                    "total_chunks": len(chunks)
+                })
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {i}: {e}")
+                continue
 
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
         try:
