@@ -98,10 +98,12 @@ class SpeechServer:
         print("Loading SpeechT5 models...")
         self.tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
         self.tts_model = SpeechT5ForTextToSpeech.from_pretrained(
-            "microsoft/speecht5_tts"
+            "microsoft/speecht5_tts",
+            device_map="auto"
         ).to(self.device)
         self.vocoder = SpeechT5HifiGan.from_pretrained(
-            "microsoft/speecht5_hifigan"
+            "microsoft/speecht5_hifigan",
+            device_map="auto"
         ).to(self.device)
 
         # Use a fixed speaker embedding for consistency
