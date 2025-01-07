@@ -108,8 +108,8 @@ class SpeechServer:
             low_cpu_mem_usage=True,
         ).to(self.device)
 
-        # Use a fixed speaker embedding for consistency
-        self.speaker_embedding = torch.randn(1, 512).to(self.device)
+        # Ensure speaker embedding is created with the right dtype
+        self.speaker_embedding = torch.randn(1, 512, dtype=torch.float16).to(self.device)
         print("All models loaded successfully!")
 
     def setup_routes(self):
@@ -200,13 +200,21 @@ class SpeechServer:
         return response
 
     async def text_to_speech(self, text: str) -> bytes:
-        inputs = self.tts_processor(text=text, return_tensors="pt").to(self.device)
+        # Convert inputs to float16 and ensure they're on the right device
+        inputs = self.tts_processor(text=text, return_tensors="pt")
+        inputs = {k: v.to(dtype=torch.float16, device=self.device) for k, v in inputs.items()}
+        
+        # Ensure speaker embedding is float16
+        speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
         
         speech = self.tts_model.generate_speech(
             inputs["input_ids"],
-            self.speaker_embedding,
+            speaker_embedding,
             vocoder=self.vocoder
         )
+        
+        # Convert speech back to float32 for saving
+        speech = speech.to(dtype=torch.float32)
         
         buffer = io.BytesIO()
         torchaudio.save(
