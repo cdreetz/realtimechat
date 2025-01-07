@@ -144,9 +144,15 @@ class SpeechServer:
         hop_length = 512
         frames = torch.from_numpy(audio_data.copy()).unfold(0, frame_length, hop_length)
         frames = frames.float()
+        
+        # Calculate energy and increase threshold
         energy = frames.pow(2).mean(dim=1)
-        threshold = energy.mean() * 1.5
-        speech_detected = (energy > threshold).any().item()
+        threshold = energy.mean() * 2.5  # Increased from 1.5 to 2.5
+        
+        # Add minimum energy requirement
+        min_energy = 0.001  # Adjust this value based on testing
+        speech_detected = (energy > threshold).any().item() and energy.mean() > min_energy
+        
         if speech_detected:
             logger.info("Speech detected in audio chunk")
         return speech_detected
@@ -221,10 +227,19 @@ class SpeechServer:
                 audio_bytes = base64.b64decode(data)
                 audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
                 
+                # Add minimum length check
+                if len(audio_array) < 2048:  # Adjust this value based on your needs
+                    return
+                
                 # Check for speech
                 if await self.detect_speech(audio_array):
                     # Convert speech to text
                     text = await self.speech_to_text(audio_array)
+                    
+                    # Skip empty or very short transcriptions
+                    if not text or len(text.strip()) <= 1:
+                        return
+                        
                     await websocket.send_json({
                         "type": "transcription",
                         "data": text
@@ -232,6 +247,12 @@ class SpeechServer:
                     
                     # Generate response
                     response = await self.generate_chat_response(text)
+                    
+                    # Add conversation context to avoid repetitive responses
+                    if hasattr(self, 'last_response') and response == self.last_response:
+                        return
+                    self.last_response = response
+                    
                     try:
                         await websocket.send_json({
                             "type": "chat_response",
