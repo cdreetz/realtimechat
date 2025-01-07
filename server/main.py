@@ -20,6 +20,7 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 import logging
+import os
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s -%(name)s -%(levelname)s -%(message)s')
 logger = logging.getLogger(__name__)
@@ -94,13 +95,17 @@ class SpeechServer:
         print("Loading XTTS model...")
         torch.cuda.empty_cache()
         self.tts_config = XttsConfig()
-        self.tts_config.load_json("models/xtts/config.json")  # Update with your config path
+        self.tts_config.load_json("models/xtts/config.json")
         self.tts_model = Xtts.init_from_config(self.tts_config)
-        self.tts_model.load_checkpoint(self.tts_config, checkpoint_dir="models/xtts/model.pth", eval=True)  # Update with your checkpoint path
+        self.tts_model.load_checkpoint(self.tts_config, checkpoint_dir="models/xtts/model.pth", eval=True)
         self.tts_model.cuda()
 
-        # Load a reference audio file for the voice
-        self.reference_audio = "path/to/reference.wav"  # Update with your reference audio path
+        # Update this path to point to your actual reference audio file
+        self.reference_audio = "../sample/female.wav"  # Update this path
+        
+        # Add validation check
+        if not os.path.exists(self.reference_audio):
+            raise FileNotFoundError(f"Reference audio file not found at: {self.reference_audio}")
 
         print("All models loaded successfully!")
 
