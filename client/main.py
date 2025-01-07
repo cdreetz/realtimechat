@@ -74,8 +74,8 @@ class SpeechClient:
         self.audio_processor = AudioProcessor()
         self.websocket = None
         self.running = False
-        self.last_speech_time = None
-        self.silence_threshold = 2.0  # seconds
+        self.last_audio_time = None  # Track when we last detected significant audio
+        self.silence_threshold = 1.0  # Wait for 1 second of silence before sending
         self._connection_lock = asyncio.Lock()
         
     async def ensure_connection(self):
@@ -156,13 +156,13 @@ class SpeechClient:
                     # Handle streaming audio chunk
                     audio_bytes = base64.b64decode(data["data"])
                     audio_data = io.BytesIO(audio_bytes)
-                    data, samplerate = sf.read(audio_data)
-                    sd.play(data, samplerate)
+                    audio_array, samplerate = sf.read(audio_data)
+                    sd.play(audio_array, samplerate)
                     sd.wait()  # Wait for this chunk to finish playing
                     
-                    # Log progress if desired
-                    chunk_num = data.get("chunk", 0)
-                    total_chunks = data.get("total_chunks", 1)
+                    # Log progress using direct dictionary access
+                    chunk_num = data["chunk"]
+                    total_chunks = data["total_chunks"]
                     logger.debug(f"Played audio chunk {chunk_num + 1}/{total_chunks}")
                 
                 elif data["type"] == "audio_response":
@@ -187,25 +187,41 @@ class SpeechClient:
     async def process_audio(self):
         chunks = []
         total_frames = 0
-        target_frames = self.sample_rate * 0.5  # Reduced to 0.5 seconds chunks
+        self.last_audio_time = None
         
         while self.running:
             try:
                 chunk = self.audio_processor.get_audio_chunk()
                 
                 if chunk is not None:
+                    # Check audio level
+                    audio_level = np.max(np.abs(chunk))
+                    current_time = time.time()
+                    
+                    # Update last_audio_time if we detect significant audio
+                    if audio_level > 0.01:  # Adjust this threshold as needed
+                        self.last_audio_time = current_time
+                    
                     # Amplify the audio signal
                     chunk = chunk * 5.0  # Increase volume
                     chunks.append(chunk)
                     total_frames += len(chunk)
                     
-                    if total_frames >= target_frames:
-                        audio_data = np.concatenate(chunks)
-                        logger.info(f"Sending audio chunk: shape={audio_data.shape}, dtype={audio_data.dtype}, "
-                                  f"min={audio_data.min():.3f}, max={audio_data.max():.3f}")
-                        await self.send_audio(audio_data)
-                        chunks = []
-                        total_frames = 0
+                    # Only send audio if:
+                    # 1. We have enough frames (0.5 seconds worth)
+                    # 2. There's been silence for self.silence_threshold seconds
+                    if (total_frames >= self.audio_processor.sample_rate * 0.5 and 
+                        (self.last_audio_time is None or 
+                         current_time - self.last_audio_time > self.silence_threshold)):
+                        
+                        if chunks:  # Make sure we have audio to send
+                            audio_data = np.concatenate(chunks)
+                            logger.info(f"Sending audio chunk: shape={audio_data.shape}, dtype={audio_data.dtype}, "
+                                      f"min={audio_data.min():.3f}, max={audio_data.max():.3f}")
+                            await self.send_audio(audio_data)
+                            chunks = []
+                            total_frames = 0
+                            self.last_audio_time = None  # Reset the timer
                 
                 await asyncio.sleep(0.01)
             except Exception as e:
