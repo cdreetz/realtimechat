@@ -94,9 +94,9 @@ class SpeechServer:
         print("Loading XTTS model...")
         torch.cuda.empty_cache()
         self.tts_config = XttsConfig()
-        self.tts_config.load_json("path/to/xtts/config.json")  # Update with your config path
+        self.tts_config.load_json("models/xtts/config.json")  # Update with your config path
         self.tts_model = Xtts.init_from_config(self.tts_config)
-        self.tts_model.load_checkpoint(self.tts_config, checkpoint_dir="path/to/xtts/", eval=True)  # Update with your checkpoint path
+        self.tts_model.load_checkpoint(self.tts_config, checkpoint_dir="models/xtts/model.pth", eval=True)  # Update with your checkpoint path
         self.tts_model.cuda()
 
         # Load a reference audio file for the voice
