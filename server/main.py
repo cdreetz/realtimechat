@@ -10,7 +10,10 @@ from transformers import (
     AutoTokenizer,
     SpeechT5Processor, 
     SpeechT5ForTextToSpeech,
-    SpeechT5HifiGan
+    SpeechT5HifiGan,
+    AutoModelForSpeechSeq2Seq,
+    AutoProcessor,
+    pipeline
 )
 import io
 import json
@@ -69,28 +72,44 @@ class SpeechServer:
     def setup_models(self):
         print("Loading models...")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         print(f"Using device: {self.device}")
 
         # Load models one at a time with cache clearing
         print("Loading Whisper model...")
         torch.cuda.empty_cache()
-        self.whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
-        self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
             "openai/whisper-large-v3-turbo",
-            device_map="auto",
-            torch_dtype=torch.float16,
+            torch_dtype=self.torch_dtype,
             low_cpu_mem_usage=True,
+        ).to(self.device)
+        
+        self.whisper_processor = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+        
+        self.whisper_pipe = pipeline(
+            "automatic-speech-recognition",
+            model=self.whisper_model,
+            tokenizer=self.whisper_processor.tokenizer,
+            feature_extractor=self.whisper_processor.feature_extractor,
+            chunk_length_s=30,
+            batch_size=16,
+            torch_dtype=self.torch_dtype,
+            device=self.device,
         )
 
         print("Loading Llama model...")
         torch.cuda.empty_cache()
         self.chat_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        self.chat_tokenizer.pad_token = self.chat_tokenizer.eos_token
+        self.chat_tokenizer.padding_side = "right"
+        
         self.chat_model = AutoModelForCausalLM.from_pretrained(
             "meta-llama/Llama-3.2-1B-Instruct",
             device_map="auto",
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
+        self.chat_model.config.pad_token_id = self.chat_tokenizer.pad_token_id
 
         print("Loading SpeechT5 models...")
         torch.cuda.empty_cache()
@@ -159,32 +178,30 @@ class SpeechServer:
 
     async def speech_to_text(self, audio_data: np.ndarray) -> str:
         logger.info("Transcribing speech...")
-        input_features = self.whisper_processor(
-            audio_data, 
-            sampling_rate=16000, 
-            return_tensors="pt"
-        ).input_features.to(self.device)
-        
-        # Cast input to float16
-        input_features = input_features.to(torch.float16)
-        
-        predicted_ids = self.whisper_model.generate(input_features)
-        transcription = self.whisper_processor.batch_decode(
-            predicted_ids, 
-            skip_special_tokens=True
-        )[0]
+        result = self.whisper_pipe(
+            audio_data,
+            generate_kwargs={"language": "english"}
+        )
+        transcription = result["text"]
         logger.info(f"Transcribed: {transcription}")
         return transcription
 
     async def generate_chat_response(self, text: str) -> str:
         logger.info("Generating response...")
+        # Get the model's device
+        model_device = self.chat_model.device
+        
         inputs = self.chat_tokenizer(
             f"User: {text}\nAssistant:",
             return_tensors="pt",
             return_attention_mask=True,
             max_length=512,
-            truncation=True
-        ).to(self.device)
+            truncation=True,
+            padding=True
+        )
+        
+        # Move inputs to the same device as the model
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
         
         outputs = self.chat_model.generate(
             **inputs,
