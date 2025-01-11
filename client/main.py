@@ -23,6 +23,8 @@ class AudioProcessor:
         self.dtype = dtype
         self.audio_queue = Queue()
         self.is_recording = False
+        self.is_hearing_audio = False
+        self.is_playing = False  # Add flag to track when we're playing audio
         
         logger.info("Available audio devices:")
         logger.info(sd.query_devices())
@@ -31,18 +33,24 @@ class AudioProcessor:
         if status:
             logger.warning(f"Audio callback status: {status}")
         
-        # More verbose audio level logging
-        audio_level = np.max(np.abs(indata))
-        if audio_level > 0.01:  # Only log when there's significant audio
-            logger.info(f"Audio detected! Level: {audio_level:.3f}")
-        
-        self.audio_queue.put(indata.copy())
+        # Only process input when not playing audio
+        if not self.is_playing:
+            audio_level = np.max(np.abs(indata))
+            if audio_level > 0.05:
+                if not self.is_hearing_audio:
+                    logger.info("Audio started...")
+                    self.is_hearing_audio = True
+            elif self.is_hearing_audio:
+                logger.info("Audio ended...")
+                self.is_hearing_audio = False
+            
+            self.audio_queue.put(indata.copy())
 
     def start_recording(self):
         self.is_recording = True
         
         device_info = sd.query_devices(1, 'input')
-        logger.info(f"Using input device: {device_info}")
+        logger.info(f"Using input device: {device_info['name']}")  # Only log device name
         
         # Force 16kHz sample rate for speech recognition
         self.stream = sd.InputStream(
@@ -54,7 +62,7 @@ class AudioProcessor:
             blocksize=1024
         )
         self.stream.start()
-        logger.info("Audio stream started")
+        logger.info("Listening...")
 
     def stop_recording(self):
         self.is_recording = False
@@ -134,6 +142,8 @@ class SpeechClient:
         return await self.send_message(message)
 
     async def handle_server_messages(self):
+        audio_chunks = {}
+        
         while self.running:
             try:
                 if not await self.ensure_connection():
@@ -143,9 +153,6 @@ class SpeechClient:
                 message = await self.websocket.recv()
                 data = json.loads(message)
                 
-                # Log all received messages for debugging
-                logger.debug(f"Received message type: {data['type']}")
-                
                 if data["type"] == "transcription":
                     logger.info(f"Transcription: {data['data']}")
                 
@@ -153,25 +160,42 @@ class SpeechClient:
                     logger.info(f"Assistant: {data['data']}")
                 
                 elif data["type"] == "audio_response_chunk":
-                    # Handle streaming audio chunk
-                    audio_bytes = base64.b64decode(data["data"])
-                    audio_data = io.BytesIO(audio_bytes)
-                    audio_array, samplerate = sf.read(audio_data)
-                    sd.play(audio_array, samplerate)
-                    sd.wait()  # Wait for this chunk to finish playing
+                    # Create storage for this chunk if it doesn't exist
+                    chunk_id = data["chunk"]
+                    if chunk_id not in audio_chunks:
+                        audio_chunks[chunk_id] = [None] * data["total_sub_chunks"]
                     
-                    # Log progress using direct dictionary access
-                    chunk_num = data["chunk"]
-                    total_chunks = data["total_chunks"]
-                    logger.debug(f"Played audio chunk {chunk_num + 1}/{total_chunks}")
-                
-                elif data["type"] == "audio_response":
-                    # Keep old handler for backward compatibility
-                    audio_bytes = base64.b64decode(data["data"])
-                    audio_data = io.BytesIO(audio_bytes)
-                    data, samplerate = sf.read(audio_data)
-                    sd.play(data, samplerate)
-                    sd.wait()
+                    # Store this sub-chunk
+                    audio_chunks[chunk_id][data["sub_chunk"]] = data["data"]
+                    
+                    # Check if we have all sub-chunks for this chunk
+                    if None not in audio_chunks[chunk_id]:
+                        try:
+                            # Set playing flag before playing audio
+                            self.audio_processor.is_playing = True
+                            
+                            # Combine all sub-chunks
+                            full_chunk = b''.join([base64.b64decode(chunk) for chunk in audio_chunks[chunk_id]])
+                            
+                            # Convert to audio and play
+                            audio_data = io.BytesIO(full_chunk)
+                            audio_array, samplerate = sf.read(audio_data)
+                            sd.play(audio_array, samplerate)
+                            sd.wait()  # Wait for this chunk to finish playing
+                            
+                            # Add a small delay after playback
+                            await asyncio.sleep(0.1)
+                            
+                        finally:
+                            # Reset playing flag after audio is done
+                            self.audio_processor.is_playing = False
+                        
+                        # Clean up if this was the final chunk
+                        if data.get("is_final", False):
+                            audio_chunks.clear()
+                        else:
+                            # Remove this chunk's data to free memory
+                            del audio_chunks[chunk_id]
                 
                 elif data["type"] == "error":
                     logger.error(f"Server error: {data['data']}")
@@ -207,17 +231,14 @@ class SpeechClient:
                     chunks.append(chunk)
                     total_frames += len(chunk)
                     
-                    # Only send audio if:
-                    # 1. We have enough frames (0.5 seconds worth)
-                    # 2. There's been silence for self.silence_threshold seconds
+                    # Only send audio if we have enough data and silence
                     if (total_frames >= self.audio_processor.sample_rate * 0.5 and 
                         (self.last_audio_time is None or 
                          current_time - self.last_audio_time > self.silence_threshold)):
                         
                         if chunks:  # Make sure we have audio to send
                             audio_data = np.concatenate(chunks)
-                            logger.info(f"Sending audio chunk: shape={audio_data.shape}, dtype={audio_data.dtype}, "
-                                      f"min={audio_data.min():.3f}, max={audio_data.max():.3f}")
+                            logger.debug(f"Sending audio chunk: shape={audio_data.shape}")  # Move to debug level
                             await self.send_audio(audio_data)
                             chunks = []
                             total_frames = 0

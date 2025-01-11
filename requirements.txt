@@ -41,9 +41,9 @@ soundfile==0.13.0
 starlette==0.41.3
 sympy==1.13.1
 tokenizers==0.21.0
-torch==2.7.0.dev20250107
-torchaudio==2.6.0.dev20250107
-torchvision==0.22.0.dev20250107
+torch==2.5.1
+torchaudio==2.5.1
+torchvision==0.20.1
 tqdm==4.67.1
 transformers==4.47.1
 typing_extensions==4.12.2

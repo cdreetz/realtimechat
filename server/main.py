@@ -24,11 +24,18 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 import logging
+from models import build_model
+from kokoro import generate
+
+from torch.serialization import add_safe_globals
+import os
+import requests
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s -%(name)s -%(levelname)s -%(message)s')
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
 
 class ConnectionManager:
     def __init__(self):
@@ -51,9 +58,34 @@ class ConnectionManager:
 class SpeechServer:
     def __init__(self):
         self.app = FastAPI()
+        self.app.websocket_max_message_size = 5 * 1024 * 1024  # 5MB
         self.setup_cors()
         self.setup_routes()
         self.manager = ConnectionManager()
+        
+        # Add model options
+        self.available_language_models = {
+            "llama": "meta-llama/Llama-3.2-1B-Instruct",
+            "phi": "microsoft/phi-4",
+            "qwen": "Qwen/Qwen2-VL-2B-Instruct"
+        }
+        self.current_language_model = "llama"  # default model
+        self.available_voice_models = {
+            "af": "Default (Bella & Sarah mix)",
+            "af_bella": "Bella",
+            "af_sarah": "Sarah",
+            "am_adam": "Adam",
+            "am_michael": "Michael",
+            "bf_emma": "Emma",
+            "bf_isabella": "Isabella",
+            "bm_george": "George",
+            "bm_lewis": "Lewis",
+            "af_nicole": "Nicole",
+            "af_sky": "Sky"
+        }
+        self.current_voice = "af"  # default voice
+        self.voice_dir = "voices"
+        os.makedirs(self.voice_dir, exist_ok=True)
         self.setup_models()
 
         # self.stt_model = "openai/whisper-large-v3-turbo" # ~1.62GB
@@ -68,6 +100,20 @@ class SpeechServer:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    def download_voice(self, voice_name: str) -> str:
+        """Get voice model path from the cloned repository"""
+        voice_path = os.path.join('Kokoro-82M', 'voices', f'{voice_name}.pt')
+        
+        if not os.path.exists(voice_path):
+            raise FileNotFoundError(f"Voice {voice_name} not found in the repository!")
+        
+        return voice_path
+
+    def load_voice(self, voice_path: str) -> torch.Tensor:
+        """Load voice model directly"""
+        logger.info(f"Loading voice from {voice_path}")
+        return torch.load(voice_path, map_location=self.device)
 
     def setup_models(self):
         print("Loading models...")
@@ -97,38 +143,41 @@ class SpeechServer:
             device=self.device,
         )
 
-        print("Loading Llama model...")
+        print(f"Loading Language model: {self.available_language_models[self.current_language_model]}...")
         torch.cuda.empty_cache()
-        self.chat_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        self.chat_tokenizer = AutoTokenizer.from_pretrained(self.available_language_models[self.current_language_model])
         self.chat_tokenizer.pad_token = self.chat_tokenizer.eos_token
         self.chat_tokenizer.padding_side = "right"
         
         self.chat_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct",
+            self.available_language_models[self.current_language_model],
             device_map="auto",
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
         self.chat_model.config.pad_token_id = self.chat_tokenizer.pad_token_id
 
-        print("Loading SpeechT5 models...")
+        print("Loading Kokoro TTS model...")
         torch.cuda.empty_cache()
-        self.tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
-        self.tts_model = SpeechT5ForTextToSpeech.from_pretrained(
-            "microsoft/speecht5_tts",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
         
-        torch.cuda.empty_cache()
-        self.vocoder = SpeechT5HifiGan.from_pretrained(
-            "microsoft/speecht5_hifigan",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
+        # Clone the repository if it doesn't exist
+        if not os.path.exists('Kokoro-82M'):
+            os.system('git clone https://huggingface.co/hexgrad/Kokoro-82M')
+        
+        # Use the model from the cloned repository
+        model_path = os.path.join('Kokoro-82M', 'kokoro-v0_19.pth')
+        if not os.path.exists(model_path):
+            raise FileNotFoundError("Kokoro model not found! Please ensure the repository was cloned correctly.")
+        self.tts_model = build_model(model_path, self.device)
+        
+        # Load voice directly from the repository
+        voice_path = os.path.join('Kokoro-82M', 'voices', f'{self.current_voice}.pt')
+        if not os.path.exists(voice_path):
+            raise FileNotFoundError(f"Voice {self.current_voice} not found in the repository!")
+        
+        self.voicepack = torch.load(voice_path, map_location=self.device)
+        print(f"Loaded voice: {self.current_voice}")
 
-        # Ensure speaker embedding is created with the right dtype
-        self.speaker_embedding = torch.randn(1, 512, dtype=torch.float16).to(self.device)
         print("All models loaded successfully!")
 
     def setup_routes(self):
@@ -152,11 +201,47 @@ class SpeechServer:
                         logger.info("Client disconnected normally")
                         break
                     except Exception as e:
-                        print(f"Error in websocket loop: {e}")
+                        logger.error(f"Error in websocket loop: {str(e)}")
                         break
+            except Exception as e:
+                logger.error(f"Websocket error: {str(e)}")
             finally:
-                self.manager.disconect(websocket)
+                self.manager.disconnect(websocket)
                 logger.info("Cleaned up connection")
+
+        @self.app.get("/available_models")
+        async def get_available_models():
+            return {
+                "current_model": self.current_language_model,
+                "available_models": list(self.available_language_models.keys())
+            }
+
+        @self.app.post("/change_voice/{voice_name}")
+        async def change_voice(voice_name: str):
+            if voice_name not in self.available_voice_models:
+                return {"error": f"Voice {voice_name} not available"}
+            
+            try:
+                voice_path = self.download_voice(voice_name)
+                self.voicepack = self.load_voice(voice_path)
+                self.current_voice = voice_name
+                
+                return {
+                    "status": "success",
+                    "message": f"Changed voice to {voice_name}",
+                    "voice_name": voice_name,
+                    "voice_description": self.available_voice_models[voice_name]
+                }
+            except Exception as e:
+                logger.error(f"Failed to change voice: {str(e)}")
+                return {"error": f"Failed to change voice: {str(e)}"}
+
+        @self.app.get("/available_voices")
+        async def get_available_voices():
+            return {
+                "current_voice": self.current_voice,
+                "available_voices": self.available_voice_models
+            }
 
     async def detect_speech(self, audio_data: np.ndarray) -> bool:
         frame_length = 1024
@@ -191,8 +276,14 @@ class SpeechServer:
         # Get the model's device
         model_device = self.chat_model.device
         
+        # Add a system prompt to better guide responses
+        prompt = (
+            "You are a helpful AI assistant. Respond naturally and directly to what "
+            "the user says.\n\nUser: {}\nAssistant:"
+        ).format(text)
+        
         inputs = self.chat_tokenizer(
-            f"User: {text}\nAssistant:",
+            prompt,
             return_tensors="pt",
             return_attention_mask=True,
             max_length=512,
@@ -206,9 +297,11 @@ class SpeechServer:
         outputs = self.chat_model.generate(
             **inputs,
             max_length=512,
+            min_length=1,  # Allow shorter responses
             temperature=0.7,
             top_p=0.9,
-            pad_token_id=self.chat_tokenizer.eos_token_id
+            pad_token_id=self.chat_tokenizer.eos_token_id,
+            repetition_penalty=1.2  # Discourage repetitive responses
         )
         
         response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -217,18 +310,20 @@ class SpeechServer:
         return response
 
     async def text_to_speech(self, text: str, websocket: WebSocket) -> None:
+        logger.info(f"Processing TTS for text: {text[:50]}...")
+        
+        # Add basic text normalization
+        text = text.replace("...", ".").replace("..", ".")  # Fix multiple periods
+        text = " ".join(text.split())  # Normalize whitespace
+        
         # Split text into sentences and chunk them
-        sentences = text.split('.')
+        sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
         chunks = []
         current_chunk = []
         current_length = 0
-        max_chunk_length = 100  # Adjust based on testing
+        max_chunk_length = 100
         
         for sentence in sentences:
-            sentence = sentence.strip() + '.'  # Add back the period
-            if not sentence:
-                continue
-            
             if current_length + len(sentence.split()) > max_chunk_length:
                 if current_chunk:
                     chunks.append(' '.join(current_chunk))
@@ -241,46 +336,83 @@ class SpeechServer:
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         
+        logger.info(f"Split into {len(chunks)} chunks")
+        
         # Process and stream each chunk
+        chunk_size = 256 * 1024  # 256KB chunks
+        audio_chunks = []  # Store all audio chunks before sending
+        
+        # First generate all audio chunks
         for i, chunk in enumerate(chunks):
-            inputs = self.tts_processor(
-                text=chunk,
-                return_tensors="pt",
-            )
-            
-            inputs = {
-                "input_ids": inputs["input_ids"].to(self.device),
-                "attention_mask": inputs["attention_mask"].to(self.device)
-            }
-            
-            speaker_embedding = self.speaker_embedding.to(dtype=torch.float16)
-            
-            speech = self.tts_model.generate_speech(
-                inputs["input_ids"],
-                speaker_embedding,
-                vocoder=self.vocoder
-            )
-            
-            # Convert to float32 for saving
-            speech = speech.to(dtype=torch.float32)
-            
-            # Save this chunk to buffer
-            buffer = io.BytesIO()
-            torchaudio.save(
-                buffer,
-                speech.cpu().unsqueeze(0),
-                sample_rate=16000,
-                format="wav"
-            )
-            
-            # Send this chunk to the client
-            audio_b64 = base64.b64encode(buffer.getvalue()).decode()
-            await websocket.send_json({
-                "type": "audio_response_chunk",
-                "data": audio_b64,
-                "chunk": i,
-                "total_chunks": len(chunks)
-            })
+            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
+            try:
+                # Generate speech using Kokoro
+                audio, _ = generate(
+                    self.tts_model, 
+                    chunk, 
+                    self.voicepack, 
+                    lang=self.current_voice[0]
+                )
+                
+                if audio is None or len(audio) == 0:
+                    logger.error("Generated audio is empty")
+                    continue
+                    
+                logger.info(f"Generated audio shape: {audio.shape}")
+                
+                # Convert numpy array to tensor
+                speech_tensor = torch.from_numpy(audio).unsqueeze(0)
+                
+                # Save this chunk to buffer
+                buffer = io.BytesIO()
+                torchaudio.save(
+                    buffer,
+                    speech_tensor,
+                    sample_rate=24000,
+                    format="wav"
+                )
+                
+                audio_chunks.append(buffer.getvalue())
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {i}: {str(e)}")
+                continue
+        
+        # Then send all chunks
+        try:
+            total_audio_chunks = len(audio_chunks)
+            for i, audio_data in enumerate(audio_chunks):
+                # Split into sub-chunks
+                total_sub_chunks = (len(audio_data) + chunk_size - 1) // chunk_size
+                logger.info(f"Sending chunk {i+1}/{total_audio_chunks} ({total_sub_chunks} sub-chunks)")
+                
+                for j in range(total_sub_chunks):
+                    start = j * chunk_size
+                    end = min((j + 1) * chunk_size, len(audio_data))
+                    audio_sub_chunk = audio_data[start:end]
+                    
+                    try:
+                        # Send this chunk to the client
+                        audio_b64 = base64.b64encode(audio_sub_chunk).decode()
+                        await websocket.send_json({
+                            "type": "audio_response_chunk",
+                            "data": audio_b64,
+                            "chunk": i,
+                            "total_chunks": total_audio_chunks,
+                            "sub_chunk": j,
+                            "total_sub_chunks": total_sub_chunks,
+                            "is_final": (i == total_audio_chunks - 1 and j == total_sub_chunks - 1)
+                        })
+                        logger.info(f"Sent sub-chunk {j+1}/{total_sub_chunks}")
+                    except Exception as e:
+                        logger.error(f"Failed to send sub-chunk: {str(e)}")
+                        return  # Exit if we can't send
+                    
+                    # Add a small delay between chunks to prevent overwhelming the connection
+                    await asyncio.sleep(0.01)
+                    
+        except Exception as e:
+            logger.error(f"Error sending audio chunks: {str(e)}")
 
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
         try:
@@ -326,11 +458,13 @@ class SpeechServer:
                     except Exception as e:
                         logger.error(f"Error sending chat response: {e}")
                     
-                    # Modified TTS section
+                    # Add logging for audio generation
+                    logger.info("Starting TTS generation...")
                     try:
                         await self.text_to_speech(response, websocket)
+                        logger.info("TTS generation completed")
                     except Exception as e:
-                        logger.error(f"Error sending audio response: {e}")
+                        logger.error(f"Error in TTS generation: {str(e)}")
                         return
             
             elif message_type == "text":
@@ -341,7 +475,14 @@ class SpeechServer:
                     "data": response
                 })
                 
-                await self.text_to_speech(response, websocket)
+                # Add logging for audio generation
+                logger.info("Starting TTS generation for text input...")
+                try:
+                    await self.text_to_speech(response, websocket)
+                    logger.info("TTS generation completed")
+                except Exception as e:
+                    logger.error(f"Error in TTS generation: {str(e)}")
+                    return
             
             else:
                 await websocket.send_json({
