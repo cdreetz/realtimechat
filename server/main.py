@@ -65,11 +65,12 @@ class SpeechServer:
         
         # Add model options
         self.available_language_models = {
-            "llama": "meta-llama/Llama-3.2-1B-Instruct",
+            "llama1b": "meta-llama/Llama-3.2-1B-Instruct",
+            "llama3b": "meta-llama/Llama-3.2-3B-Instruct",
             "phi": "microsoft/phi-4",
             "qwen": "Qwen/Qwen2-VL-2B-Instruct"
         }
-        self.current_language_model = "llama"  # default model
+        self.current_language_model = "llama1b"  # default model
         self.available_voice_models = {
             "af": "Default (Bella & Sarah mix)",
             "af_bella": "Bella",
@@ -92,6 +93,16 @@ class SpeechServer:
         # self.text_model = "meta-llama/Llama-3.2-1B-Instruct" # ~2.47GB
         # self.tts_model = "microsoft/speecht5_tts"
         
+        # Add chat history management
+        self.chat_histories = {}  # Keyed by websocket
+        self.max_history_tokens = 2048  # Adjust based on your model's context window
+        
+        # System prompt to use for all conversations
+        self.system_prompt = (
+            "You are a helpful AI assistant. Respond naturally and directly to what "
+            "the user says."
+        )
+
     def setup_cors(self):
         self.app.add_middleware(
             CORSMiddleware,
@@ -271,41 +282,83 @@ class SpeechServer:
         logger.info(f"Transcribed: {transcription}")
         return transcription
 
-    async def generate_chat_response(self, text: str) -> str:
+    async def generate_chat_response(self, text: str, websocket: WebSocket) -> str:
         logger.info("Generating response...")
-        # Get the model's device
-        model_device = self.chat_model.device
         
-        # Add a system prompt to better guide responses
-        prompt = (
-            "You are a helpful AI assistant. Respond naturally and directly to what "
-            "the user says.\n\nUser: {}\nAssistant:"
-        ).format(text)
+        # Initialize chat history for new connections
+        if websocket not in self.chat_histories:
+            self.chat_histories[websocket] = [
+                {"role": "system", "content": self.system_prompt}
+            ]
         
+        # Add user message to history
+        self.chat_histories[websocket].append({"role": "user", "content": text})
+        
+        # Construct the full conversation history
+        conversation = ""
+        for message in self.chat_histories[websocket]:
+            role = message["role"]
+            content = message["content"]
+            if role == "system":
+                conversation += f"{content}\n\n"
+            elif role == "user":
+                conversation += f"User: {content}\n"
+            elif role == "assistant":
+                conversation += f"Assistant: {content}\n"
+        
+        conversation += "Assistant:"
+        
+        # Check token count and trim history if needed
+        inputs = self.chat_tokenizer(conversation, return_length=True)
+        while inputs.length[0] > self.max_history_tokens and len(self.chat_histories[websocket]) > 2:
+            # Always keep system prompt and remove oldest message pair
+            self.chat_histories[websocket] = (
+                [self.chat_histories[websocket][0]] +  # Keep system prompt
+                self.chat_histories[websocket][3:]      # Remove oldest user+assistant pair
+            )
+            # Reconstruct conversation with trimmed history
+            conversation = ""
+            for message in self.chat_histories[websocket]:
+                role = message["role"]
+                content = message["content"]
+                if role == "system":
+                    conversation += f"{content}\n\n"
+                elif role == "user":
+                    conversation += f"User: {content}\n"
+                elif role == "assistant":
+                    conversation += f"Assistant: {content}\n"
+            conversation += "Assistant:"
+            inputs = self.chat_tokenizer(conversation, return_length=True)
+        
+        # Generate response with the conversation history
         inputs = self.chat_tokenizer(
-            prompt,
+            conversation,
             return_tensors="pt",
             return_attention_mask=True,
-            max_length=512,
+            max_length=self.max_history_tokens,
             truncation=True,
             padding=True
         )
         
         # Move inputs to the same device as the model
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        inputs = {k: v.to(self.chat_model.device) for k, v in inputs.items()}
         
         outputs = self.chat_model.generate(
             **inputs,
-            max_length=512,
-            min_length=1,  # Allow shorter responses
+            max_length=self.max_history_tokens,
+            min_length=1,
             temperature=0.7,
             top_p=0.9,
             pad_token_id=self.chat_tokenizer.eos_token_id,
-            repetition_penalty=1.2  # Discourage repetitive responses
+            repetition_penalty=1.2
         )
         
         response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
         response = response.split("Assistant:")[-1].strip()
+        
+        # Add assistant response to history
+        self.chat_histories[websocket].append({"role": "assistant", "content": response})
+        
         logger.info(f"Generated response: {response}")
         return response
 
@@ -443,7 +496,7 @@ class SpeechServer:
                     })
                     
                     # Generate response
-                    response = await self.generate_chat_response(text)
+                    response = await self.generate_chat_response(text, websocket)
                     
                     # Add conversation context to avoid repetitive responses
                     if hasattr(self, 'last_response') and response == self.last_response:
@@ -469,7 +522,7 @@ class SpeechServer:
             
             elif message_type == "text":
                 # Direct text input
-                response = await self.generate_chat_response(data)
+                response = await self.generate_chat_response(data, websocket)
                 await websocket.send_json({
                     "type": "chat_response",
                     "data": response
@@ -495,6 +548,12 @@ class SpeechServer:
                 "type": "error",
                 "data": str(e)
             })
+
+    def disconnect(self, websocket: WebSocket):
+        # Clean up chat history when client disconnects
+        self.chat_histories.pop(websocket, None)
+        self.active_connections.remove(websocket)
+        self.last_activity.pop(websocket, None)
 
     def run(self, host="0.0.0.0", port=8000):
         uvicorn.run(self.app, host=host, port=port)
