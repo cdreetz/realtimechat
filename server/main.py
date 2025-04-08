@@ -25,7 +25,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import logging
 from models import build_model
-from kokoro import generate
+from kokoro import KPipeline
 
 from torch.serialization import add_safe_globals
 import os
@@ -72,7 +72,7 @@ class SpeechServer:
         }
         self.current_language_model = "llama1b"  # default model
         self.available_voice_models = {
-            "af": "Default (Bella & Sarah mix)",
+            "af_heart": "Default (Bella & Sarah mix)",
             "af_bella": "Bella",
             "af_sarah": "Sarah",
             "am_adam": "Adam",
@@ -84,7 +84,7 @@ class SpeechServer:
             "af_nicole": "Nicole",
             "af_sky": "Sky"
         }
-        self.current_voice = "af"  # default voice
+        self.current_voice = "af_heart"  # default voice
         self.voice_dir = "voices"
         os.makedirs(self.voice_dir, exist_ok=True)
         self.setup_models()
@@ -170,25 +170,19 @@ class SpeechServer:
 
         print("Loading Kokoro TTS model...")
         torch.cuda.empty_cache()
-        
-        # Clone the repository if it doesn't exist
-        if not os.path.exists('Kokoro-82M'):
-            os.system('git clone https://huggingface.co/hexgrad/Kokoro-82M')
-        
-        # Use the model from the cloned repository
-        model_path = os.path.join('Kokoro-82M', 'kokoro-v0_19.pth')
-        if not os.path.exists(model_path):
-            raise FileNotFoundError("Kokoro model not found! Please ensure the repository was cloned correctly.")
-        self.tts_model = build_model(model_path, self.device)
-        
-        # Load voice directly from the repository
-        voice_path = os.path.join('Kokoro-82M', 'voices', f'{self.current_voice}.pt')
-        if not os.path.exists(voice_path):
-            raise FileNotFoundError(f"Voice {self.current_voice} not found in the repository!")
-        
-        self.voicepack = torch.load(voice_path, map_location=self.device)
-        print(f"Loaded voice: {self.current_voice}")
 
+        try:
+            import subprocess
+            result = subprocess.run(['which', 'espeak-ng'], capture_output=True, text=True)
+            if not result.stdout.strip():
+            print("Installing espeak-ng...")
+            os.system('apt-get -qq -y install espeak-ng > /dev/null 2>&1')
+        except Exception as e:
+            print(f"Error checking/installing espeak-ng: {str(e)}")
+        
+        lang_code = self.current_voice[0]
+        self.tts_pipeline = KPipeline(lang_code=lang_code, device=self.device)
+        print(f"Loaded Kokoro TTS pipeline with language code: {lang_code}")
         print("All models loaded successfully!")
 
     def setup_routes(self):
@@ -400,32 +394,27 @@ class SpeechServer:
             logger.info(f"Processing chunk {i+1}/{len(chunks)}")
             try:
                 # Generate speech using Kokoro
-                audio, _ = generate(
-                    self.tts_model, 
-                    chunk, 
-                    self.voicepack, 
-                    lang=self.current_voice[0]
-                )
-                
-                if audio is None or len(audio) == 0:
-                    logger.error("Generated audio is empty")
-                    continue
+                audio_generator = self.tts_pipeline(chunk, voice=self.current_voice)
+                for _, _, audio in audio_generator:
+                    if audio is None or len(audio) == 0:
+                        logger.error("Generated audio is empty")
+                        continue
                     
-                logger.info(f"Generated audio shape: {audio.shape}")
-                
-                # Convert numpy array to tensor
-                speech_tensor = torch.from_numpy(audio).unsqueeze(0)
-                
-                # Save this chunk to buffer
-                buffer = io.BytesIO()
-                torchaudio.save(
-                    buffer,
-                    speech_tensor,
-                    sample_rate=24000,
-                    format="wav"
-                )
-                
-                audio_chunks.append(buffer.getvalue())
+                    logger.info(f"Generated audio shape: {audio.shape}")
+                    
+                    # Convert numpy array to tensor
+                    speech_tensor = audio.unsqueeze(0) if audio.dim() == 1 else audio
+                    
+                    # Save this chunk to buffer
+                    buffer = io.BytesIO()
+                    torchaudio.save(
+                        buffer,
+                        speech_tensor,
+                        sample_rate=24000,
+                        format="wav"
+                    )
+                    
+                    audio_chunks.append(buffer.getvalue())
                 
             except Exception as e:
                 logger.error(f"Error processing chunk {i}: {str(e)}")
