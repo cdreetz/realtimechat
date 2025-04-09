@@ -1,244 +1,258 @@
-<!doctype html>
+
+<!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebRTC AI Assistant</title>
     <style>
-      body {
-        font-family: Arial, sans-serif;
-        max-width: 800px;
-        margin: 0 auto;
-        padding: 20px;
-      }
-      #status,
-      #transcription,
-      #response {
-        margin: 10px 0;
-        padding: 10px;
-        border-radius: 5px;
-      }
-      #status {
-        background-color: #f0f0f0;
-      }
-      #transcription {
-        background-color: #e1f5fe;
-      }
-      #response {
-        background-color: #e8f5e9;
-      }
-      button {
-        padding: 10px 15px;
-        margin: 5px;
-        border: none;
-        border-radius: 5px;
-        cursor: pointer;
-      }
-      #startButton {
-        background-color: #4caf50;
-        color: white;
-      }
-      #stopButton {
-        background-color: #f44336;
-        color: white;
-      }
-      .hidden {
-        display: none;
-      }
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #status, #transcription, #response {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #status {
+            background-color: #f0f0f0;
+        }
+        #transcription {
+            background-color: #e1f5fe;
+        }
+        #response {
+            background-color: #e8f5e9;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #stopButton {
+            background-color: #f44336;
+            color: white;
+        }
+        .hidden {
+            display: none;
+        }
     </style>
-  </head>
-  <body>
+</head>
+<body>
     <h1>WebRTC AI Assistant</h1>
     <div id="status">Status: Not connected</div>
-
+    
     <div>
-      <button id="startButton">Start Conversation</button>
-      <button id="stopButton" class="hidden">Stop Conversation</button>
+        <button id="startButton">Start Conversation</button>
+        <button id="stopButton" class="hidden">Stop Conversation</button>
     </div>
-
+    
     <div id="transcription"></div>
     <div id="response"></div>
-
+    
     <script>
-      let peerConnection;
-      let audioStream;
-      let sessionId = null;
-      let processingAudio = false;
-
-      const startButton = document.getElementById("startButton");
-      const stopButton = document.getElementById("stopButton");
-      const statusDiv = document.getElementById("status");
-      const transcriptionDiv = document.getElementById("transcription");
-      const responseDiv = document.getElementById("response");
-
-      startButton.addEventListener("click", startConversation);
-      stopButton.addEventListener("click", stopConversation);
-
-      // WebSocket for signaling
-      const ws = new WebSocket(`ws://${window.location.host}/ws`);
-
-      ws.onopen = () => {
-        statusDiv.textContent = "Status: WebSocket connected";
-        sessionId = generateSessionId();
-        console.log("Session ID:", sessionId);
-      };
-
-      ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
-        console.log("Received message:", message);
-
-        switch (message.type) {
-          case "offer":
-            await handleOffer(message.data);
-            break;
-          case "ice_candidate":
+        let peerConnection;
+        let audioStream;
+        let sessionId = null;
+        let processingAudio = false;
+        
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusDiv = document.getElementById('status');
+        const transcriptionDiv = document.getElementById('transcription');
+        const responseDiv = document.getElementById('response');
+        
+        startButton.addEventListener('click', startConversation);
+        stopButton.addEventListener('click', stopConversation);
+        
+        // WebSocket for signaling
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        
+        ws.onopen = () => {
+            statusDiv.textContent = 'Status: WebSocket connected';
+            sessionId = generateSessionId();
+            console.log('Session ID:', sessionId);
+        };
+        
+        ws.onmessage = async (event) => {
+            const message = JSON.parse(event.data);
+            console.log('Received message:', message);
+            
+            switch (message.type) {
+                case 'answer':
+                    await handleOffer(message.data);
+                    break;
+                case 'ice_candidate':
+                    if (peerConnection) {
+                        try {
+                            await peerConnection.addIceCandidate(message.data);
+                        } catch (e) {
+                            console.error('Error adding ICE candidate:', e);
+                        }
+                    }
+                    break;
+                case 'transcription':
+                    transcriptionDiv.textContent = `You said: ${message.data}`;
+                    break;
+                case 'response':
+                    responseDiv.textContent = `AI: ${message.data}`;
+                    break;
+                case 'audio_ready':
+                    // Notification that audio response is ready
+                    console.log('Audio response is ready');
+                    break;
+                case 'error':
+                    console.error('Server error:', message.data);
+                    statusDiv.textContent = `Status: Error - ${message.data}`;
+                    break;
+            }
+        };
+        
+        ws.onclose = () => {
+            statusDiv.textContent = 'Status: WebSocket disconnected';
+            stopConversation();
+        };
+        
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            statusDiv.textContent = 'Status: WebSocket error';
+        };
+        
+        async function startConversation() {
+            try {
+                // Get microphone access
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }, 
+                    video: false 
+                });
+                
+                // Create peer connection
+                peerConnection = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+                
+                // Add audio track to peer connection
+                audioStream.getAudioTracks().forEach(track => {
+                    peerConnection.addTrack(track, audioStream);
+                });
+                
+                // Handle ICE candidates
+                peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        ws.send(JSON.stringify({
+                            type: 'ice_candidate',
+                            data: {
+                                candidate: event.candidate.candidate,
+                                sdpMid: event.candidate.sdpMid,
+                                sdpMLineIndex: event.candidate.sdpMLineIndex
+                            },
+                            session_id: sessionId
+                        }));
+                    }
+                };
+                
+                // Handle incoming tracks
+                peerConnection.ontrack = (event) => {
+                    console.log('Received remote track:', event.track);
+                    if (event.track.kind === 'audio') {
+                        const audioElement = new Audio();
+                        audioElement.srcObject = new MediaStream([event.track]);
+                        audioElement.play();
+                    }
+                };
+                
+                // ICE connection state change
+                peerConnection.oniceconnectionstatechange = () => {
+                    console.log('ICE connection state:', peerConnection.iceConnectionState);
+                    if (peerConnection.iceConnectionState === 'connected') {
+                        statusDiv.textContent = 'Status: Connected';
+                    } else if (peerConnection.iceConnectionState === 'disconnected' || 
+                              peerConnection.iceConnectionState === 'failed') {
+                        statusDiv.textContent = 'Status: Disconnected';
+                        stopConversation();
+                    }
+                };
+                
+                // Create offer
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: false
+                });
+                await peerConnection.setLocalDescription(offer);
+                
+                // Send offer to server
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    data: {
+                        sdp: peerConnection.localDescription.sdp,
+                        type: peerConnection.localDescription.type
+                    },
+                    session_id: sessionId
+                }));
+                
+                // Update UI
+                startButton.classList.add('hidden');
+                stopButton.classList.remove('hidden');
+                statusDiv.textContent = 'Status: Connecting...';
+                
+            } catch (error) {
+                console.error('Error starting conversation:', error);
+                statusDiv.textContent = 'Status: Error starting conversation';
+            }
+        }
+        
+        async function handleOffer(answer) {
+            if (!peerConnection) {
+                console.error('PeerConnection not initialized');
+                return;
+            }
+            
+            try {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+                
+                statusDiv.textContent = 'Status: Connected';
+            } catch (error) {
+                console.error('Error handling offer:', error);
+            }
+        }
+        
+        function stopConversation() {
+            // Close peer connection
             if (peerConnection) {
-              await peerConnection.addIceCandidate(message.data);
+                peerConnection.close();
+                peerConnection = null;
             }
-            break;
-          case "transcription":
-            transcriptionDiv.textContent = `You said: ${message.data}`;
-            break;
-          case "response":
-            responseDiv.textContent = `AI: ${message.data}`;
-            break;
-          case "audio_ready":
-            // Notification that audio response is ready
-            console.log("Audio response is ready");
-            break;
-        }
-      };
-
-      ws.onclose = () => {
-        statusDiv.textContent = "Status: WebSocket disconnected";
-        stopConversation();
-      };
-
-      ws.onerror = (error) => {
-        console.error("WebSocket error:", error);
-        statusDiv.textContent = "Status: WebSocket error";
-      };
-
-      async function startConversation() {
-        try {
-          // Get microphone access
-          audioStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: false,
-          });
-
-          // Create peer connection
-          peerConnection = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-          });
-
-          // Add audio track to peer connection
-          audioStream.getAudioTracks().forEach((track) => {
-            peerConnection.addTrack(track, audioStream);
-          });
-
-          // Handle ICE candidates
-          peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
-              ws.send(
-                JSON.stringify({
-                  type: "ice_candidate",
-                  data: event.candidate,
-                }),
-              );
+            
+            // Stop audio stream
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
             }
-          };
-
-          // Handle incoming tracks
-          peerConnection.ontrack = (event) => {
-            console.log("Received remote track:", event.track);
-            if (event.track.kind === "audio") {
-              const audioElement = new Audio();
-              audioElement.srcObject = new MediaStream([event.track]);
-              audioElement.play();
-            }
-          };
-
-          // Create offer
-          const offer = await peerConnection.createOffer();
-          await peerConnection.setLocalDescription(offer);
-
-          // Send offer to server
-          ws.send(
-            JSON.stringify({
-              type: "offer",
-              data: peerConnection.localDescription,
-              session_id: sessionId,
-            }),
-          );
-
-          // Update UI
-          startButton.classList.add("hidden");
-          stopButton.classList.remove("hidden");
-          statusDiv.textContent = "Status: Connecting...";
-        } catch (error) {
-          console.error("Error starting conversation:", error);
-          statusDiv.textContent = "Status: Error starting conversation";
+            
+            // Update UI
+            startButton.classList.remove('hidden');
+            stopButton.classList.add('hidden');
+            statusDiv.textContent = 'Status: Disconnected';
         }
-      }
-
-      async function handleOffer(offer) {
-        if (!peerConnection) {
-          console.error("PeerConnection not initialized");
-          return;
+        
+        function generateSessionId() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
         }
-
-        try {
-          await peerConnection.setRemoteDescription(
-            new RTCSessionDescription(offer),
-          );
-
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
-
-          ws.send(
-            JSON.stringify({
-              type: "answer",
-              data: peerConnection.localDescription,
-              session_id: sessionId,
-            }),
-          );
-
-          statusDiv.textContent = "Status: Connected";
-        } catch (error) {
-          console.error("Error handling offer:", error);
-        }
-      }
-
-      function stopConversation() {
-        // Close peer connection
-        if (peerConnection) {
-          peerConnection.close();
-          peerConnection = null;
-        }
-
-        // Stop audio stream
-        if (audioStream) {
-          audioStream.getTracks().forEach((track) => track.stop());
-          audioStream = null;
-        }
-
-        // Update UI
-        startButton.classList.remove("hidden");
-        stopButton.classList.add("hidden");
-        statusDiv.textContent = "Status: Disconnected";
-      }
-
-      function generateSessionId() {
-        return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(
-          /[xy]/g,
-          function (c) {
-            const r = (Math.random() * 16) | 0,
-              v = c == "x" ? r : (r & 0x3) | 0x8;
-            return v.toString(16);
-          },
-        );
-      }
     </script>
-  </body>
+</body>
 </html>
