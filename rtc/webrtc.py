@@ -77,6 +77,7 @@ class WebRTCServer:
     def __init__(self, inference_server_url="http://localhost:8001"):
         self.app = FastAPI()
         self.inference_server_url = inference_server_url
+        logger.info(f"Using inference server at: {inference_server_url}")
         self.setup_cors()
         self.setup_routes()
         
@@ -91,6 +92,20 @@ class WebRTCServer:
         
         # Mount static files
         self.app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+        async def test_inference_server():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    response = await session.get(f"{inference_server_url}/", timeout=5)
+                    if response.status = 200:
+                        logger.info("Successfully connected to inference server")
+                        return True
+                    else:
+                        logger.error(f"Inference server returned unexpected status: {response.status}")
+                        return False
+            except Exception as e:
+                logger.error(f"Failed to connect to ifnerence server: {str(e)}")
+                return False
 
     def setup_cors(self):
         self.app.add_middleware(
@@ -272,75 +287,81 @@ class WebRTCServer:
                 
             # Send audio to inference server for transcription
             async with aiohttp.ClientSession() as session:
-                logger.info("sending to inference server for transcription")
-                response = await session.post(
-                    f"{self.inference_server_url}/transcribe",
-                    json={
-                        "audio_data": audio_data.tolist(),
-                        "sample_rate": 16000
-                    },
-                    timeout=30
-                )
-                
-                if response.status != 200:
-                    logger.error(f"Transcription error: {await response.text()}")
-                    return
+                try:
+                    logger.info("sending to inference server for transcription")
+                    response = await session.post(
+                        f"{self.inference_server_url}/transcribe",
+                        json={
+                            "audio_data": audio_data.tolist(),
+                            "sample_rate": 16000
+                        },
+                        timeout=30
+                    )
                     
-                result = await response.json()
-                text = result.get("text", "")
-                
-                # Skip if no text was transcribed
-                if not text or len(text.strip()) <= 1:
-                    return
+                    if response.status != 200:
+                        logger.error(f"Transcription error: {await response.text()}")
+                        return
+                        
+                    result = await response.json()
+                    text = result.get("text", "")
                     
-                # Send transcription to client
-                await websocket.send_json({
-                    "type": "transcription",
-                    "data": text
-                })
+                    # Skip if no text was transcribed
+                    if not text or len(text.strip()) <= 1:
+                        return
+                        
+                    # Send transcription to client
+                    await websocket.send_json({
+                        "type": "transcription",
+                        "data": text
+                    })
 
-                response = await session.post(
-                    f"{self.inference_server_url}/generate_response",
-                    json={
-                        "text": text,
-                        "session_id": session_id
-                    }
-                )
+                    response = await session.post(
+                        f"{self.inference_server_url}/generate_response",
+                        json={
+                            "text": text,
+                            "session_id": session_id
+                        }
+                    )
 
-                if response.status != 200:
-                    logger.error(f"Text generation error: {await response.text()}")
-                    return
+                    if response.status != 200:
+                        logger.error(f"Text generation error: {await response.text()}")
+                        return
 
-                result = await response.json()
-                response_text = result.get("responst", "")
+                    result = await response.json()
+                    response_text = result.get("responst", "")
 
-                logger.info(f"Response: {response_text}")
+                    logger.info(f"Response: {response_text}")
 
-                await websocket.send_json({
-                    "type": "response",
-                    "data": response_text
-                })
+                    await websocket.send_json({
+                        "type": "response",
+                        "data": response_text
+                    })
 
-                logger.info("Synthesising speech..")
-                tts_response = await session.post(
-                    f"{self.inference_server_url}/synthesize_speech",
-                    json={
-                        "text": response_text,
-                        "session_id": session_id
-                    }
-                )
+                    logger.info("Synthesising speech..")
+                    tts_response = await session.post(
+                        f"{self.inference_server_url}/synthesize_speech",
+                        json={
+                            "text": response_text,
+                            "session_id": session_id
+                        }
+                    )
 
-                if tts_response != 200:
-                    logger.error(f"Speech synthessis error: {await tts_response.text()}")
-                    return
+                    if tts_response != 200:
+                        logger.error(f"Speech synthessis error: {await tts_response.text()}")
+                        return
 
-                audio_result = await tts_response.json()
-                audio_data = np.array(audio_result.get("audio", []), dtype=np.float32)
+                    audio_result = await tts_response.json()
+                    audio_data = np.array(audio_result.get("audio", []), dtype=np.float32)
 
-                if len(audio_data) > 0:
-                    logger.info(f"Synthesized {len(audio_data)} audio samples")
-                    await self.send_audio_to_client(audio_data, websocket)
-                
+                    if len(audio_data) > 0:
+                        logger.info(f"Synthesized {len(audio_data)} audio samples")
+                        await self.send_audio_to_client(audio_data, websocket)
+
+                except aiohttp.ClientError as e:
+                    logger.error(f"Connection error to inference server: {str(e)}")
+
+                except Exception as e:
+                    logger.error(f"Error in inference processing: {str(e)}")
                 
         except Exception as e:
             logger.error(f"Error processing audio: {str(e)}")
