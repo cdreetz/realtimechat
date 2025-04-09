@@ -165,6 +165,10 @@ class InferenceServer:
                 "sessions": len(self.chat_histories)
             }
 
+        @self.app.post("/test")
+        async def test_endpoint():
+            return {"status": "ok", "message": "Inference server is working"}
+
         @self.app.post("/transcribe")
         async def transcribe_speech(request: TranscriptionRequest):
             try:

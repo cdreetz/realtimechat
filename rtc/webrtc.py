@@ -47,33 +47,28 @@ class AudioProcessTrack(MediaStreamTrack):
         
     async def recv(self):
         frame = await self.track.recv()
-        
-        # Convert to mono if needed and update sample rate
-        if frame.format.name != "s16" or frame.layout.name != "mono" or frame.sample_rate != self.sample_rate:
-            # Convert to mono s16 PCM at 16kHz
-            frame = frame.reformat(
-                format="s16",
-                layout="mono",
-                sample_rate=self.sample_rate
-            )
-        
-        # Process audio data
-        audio_data = frame.to_ndarray()
-        audio_data = audio_data.flatten()
-        self.buffer.append(audio_data)
-        self.buffer_duration += frame.samples / frame.sample_rate
-        
+
+        numpy_data = frame.to_ndarray()
+
+        if len(numpy_data.shape) > 1:
+            numpy_data = numpy_data.mean(axis=1)
+
+        if numpy_data.dtype != np.float32:
+            numpy_data = numpy_data.astype(np.float32)
+            if numpy_data.max() > 1.0:
+                numpy_data = numpy_data / 32768.0
+
+        self.buffer.append(numpy_data)
+        self.buffer_duration += len(numpy_data) / self.sample_rate
+
         if self.buffer_duration >= self.target_duration:
-            # Concatenate buffer
             audio_concat = np.concatenate(self.buffer)
             self.buffer = []
             self.buffer_duration = 0
-            
-            # Convert to float32 for processing
-            audio_float32 = audio_concat.astype(np.float32) / 32768.0
-            
-            # Process audio asynchronously
-            asyncio.create_task(self.callback(audio_float32))
+
+            if np.max(np.abs(audio_concat)) > 0.01:
+                logger.info(f"Sending {len(audio_concat)} samples for processing")
+                asyncio.create_task(self.callback(audio_concat))
         
         return frame
 
@@ -174,10 +169,14 @@ class WebRTCServer:
             def on_track(track):
                 logger.info(f"Received track: {track.kind}")
                 if track.kind == "audio":
+                    relayed_track = self.media_relay.subscribe(track)
+
                     # Create processor for audio track
                     audio_processor = AudioProcessTrack(
-                        track=self.media_relay.subscribe(track),
-                        callback=lambda audio_data: asyncio.create_task(self.process_audio(audio_data, websocket, session_id))
+                        track=relayed_track,
+                        callback=lambda audio_data: asyncio.create_task(
+                            self.process_audio(audio_data, websocket, session_id)
+                        )
                     )
                     self.audio_processors[websocket] = audio_processor
                     
@@ -267,15 +266,20 @@ class WebRTCServer:
             # First check if there's proper audio data
             if len(audio_data) == 0:
                 return
+
+            if np.max(np.abs(audio_data)) < 0.01:
+                return
                 
             # Send audio to inference server for transcription
             async with aiohttp.ClientSession() as session:
+                logger.info("sending to inference server for transcription")
                 response = await session.post(
                     f"{self.inference_server_url}/transcribe",
                     json={
                         "audio_data": audio_data.tolist(),
                         "sample_rate": 16000
-                    }
+                    },
+                    timeout=30
                 )
                 
                 if response.status != 200:
@@ -286,7 +290,7 @@ class WebRTCServer:
                 text = result.get("text", "")
                 
                 # Skip if no text was transcribed
-                if not text:
+                if not text or len(text.strip()) <= 1:
                     return
                     
                 # Send transcription to client
@@ -294,9 +298,49 @@ class WebRTCServer:
                     "type": "transcription",
                     "data": text
                 })
+
+                response = await session.post(
+                    f"{self.inference_server_url}/generate_response",
+                    json={
+                        "text": text,
+                        "session_id": session_id
+                    }
+                )
+
+                if response.status != 200:
+                    logger.error(f"Text generation error: {await response.text()}")
+                    return
+
+                result = await response.json()
+                response_text = result.get("responst", "")
+
+                logger.info(f"Response: {response_text}")
+
+                await websocket.send_json({
+                    "type": "response",
+                    "data": response_text
+                })
+
+                logger.info("Synthesising speech..")
+                tts_response = await session.post(
+                    f"{self.inference_server_url}/synthesize_speech",
+                    json={
+                        "text": response_text,
+                        "session_id": session_id
+                    }
+                )
+
+                if tts_response != 200:
+                    logger.error(f"Speech synthessis error: {await tts_response.text()}")
+                    return
+
+                audio_result = await tts_response.json()
+                audio_data = np.array(audio_result.get("audio", []), dtype=np.float32)
+
+                if len(audio_data) > 0:
+                    logger.info(f"Synthesized {len(audio_data)} audio samples")
+                    await self.send_audio_to_client(audio_data, websocket)
                 
-                # Process the transcription if it's not empty
-                await self.process_text(text, websocket, session_id)
                 
         except Exception as e:
             logger.error(f"Error processing audio: {str(e)}")
@@ -370,14 +414,26 @@ class WebRTCServer:
 
             pc = self.peer_connections[websocket]
 
+            if not hasattr(self, '_audio_transceivers'):
+                self._audio_transceivers = {}
+
+            if websocket not in self._audio_transceivers:
+                logger.info("creating new audio transceiver")
+
+                output_track = MediaStreamTrack()
+                output_track.kind = "audio"
+
+                transceiver = pc.addTransceiver(output_track)
+                self._audio_transceiver[websocket] = (transceiver, output_track)
+
+            _, output_track = self._audio_transceivers[websocket]
+
             audio_int16 = (audio_data * 32767).astype(np.int16)
 
-            if not hasattr(self, 'audio_sender') or not self.audio_sender:
-                audio_track = MediaStreamTrack()
-                audio_track.kind = "audio"
-                self.audio_sender = pc.addTrack(audio_track)
-
             chunk_size = 960
+            num_chunks = (len(audio_int16) + chunk_size - 1) // chunk_size
+
+            logger.info(f"Sending audio data in {num_chunks} chunks")
 
             for i in range(0, len(audio_int16), chunk_size):
                 chunk = audio_int16[i:i+chunk_size]
@@ -385,21 +441,23 @@ class WebRTCServer:
                 if len(chunk) < chunk_size:
                     chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
 
-                frame = AudioFrame(
+                frame = av.AudioFrame.from_ndarray(
+                    chunk.reshape(1, -1),
                     format="s16",
                     layout="mono",
-                    samples=chunk_size
                 )
 
                 frames.sample_rate = 16000
-                frames.pt = i // chunk_size
+                #frames.pt = i // chunk_size
                 frames.time_base = fractions.Fraction(1, 16000)
 
-                frames.planes[0].update(chunk.tobytes())
+                #frames.planes[0].update(chunk.tobytes())
 
-                self.audio_sender.track.emit(frame)
+                output_track.emit(frame)
 
-                await asyncio.sleep(0.5)
+                #self.audio_sender.track.emit(frame)
+
+                await asyncio.sleep(0.05)
 
             logger.info("Finished sending audio to client")
 
@@ -412,271 +470,10 @@ class WebRTCServer:
         uvicorn.run(self.app, host=host, port=port)
 
 
-# Create a simple HTML file for testing
-index_html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC AI Assistant</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        #status, #transcription, #response {
-            margin: 10px 0;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        #status {
-            background-color: #f0f0f0;
-        }
-        #transcription {
-            background-color: #e1f5fe;
-        }
-        #response {
-            background-color: #e8f5e9;
-        }
-        button {
-            padding: 10px 15px;
-            margin: 5px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        #startButton {
-            background-color: #4CAF50;
-            color: white;
-        }
-        #stopButton {
-            background-color: #f44336;
-            color: white;
-        }
-        .hidden {
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <h1>WebRTC AI Assistant</h1>
-    <div id="status">Status: Not connected</div>
-    
-    <div>
-        <button id="startButton">Start Conversation</button>
-        <button id="stopButton" class="hidden">Stop Conversation</button>
-    </div>
-    
-    <div id="transcription"></div>
-    <div id="response"></div>
-    
-    <script>
-        let peerConnection;
-        let audioStream;
-        let sessionId = null;
-        let processingAudio = false;
-        
-        const startButton = document.getElementById('startButton');
-        const stopButton = document.getElementById('stopButton');
-        const statusDiv = document.getElementById('status');
-        const transcriptionDiv = document.getElementById('transcription');
-        const responseDiv = document.getElementById('response');
-        
-        startButton.addEventListener('click', startConversation);
-        stopButton.addEventListener('click', stopConversation);
-        
-        // WebSocket for signaling
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
-        
-        ws.onopen = () => {
-            statusDiv.textContent = 'Status: WebSocket connected';
-            sessionId = generateSessionId();
-            console.log('Session ID:', sessionId);
-        };
-        
-        ws.onmessage = async (event) => {
-            const message = JSON.parse(event.data);
-            console.log('Received message:', message);
-            
-            switch (message.type) {
-                case 'answer':
-                    await handleOffer(message.data);
-                    break;
-                case 'ice_candidate':
-                    if (peerConnection) {
-                        try {
-                            await peerConnection.addIceCandidate(message.data);
-                        } catch (e) {
-                            console.error('Error adding ICE candidate:', e);
-                        }
-                    }
-                    break;
-                case 'transcription':
-                    transcriptionDiv.textContent = `You said: ${message.data}`;
-                    break;
-                case 'response':
-                    responseDiv.textContent = `AI: ${message.data}`;
-                    break;
-                case 'audio_ready':
-                    // Notification that audio response is ready
-                    console.log('Audio response is ready');
-                    break;
-                case 'error':
-                    console.error('Server error:', message.data);
-                    statusDiv.textContent = `Status: Error - ${message.data}`;
-                    break;
-            }
-        };
-        
-        ws.onclose = () => {
-            statusDiv.textContent = 'Status: WebSocket disconnected';
-            stopConversation();
-        };
-        
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-            statusDiv.textContent = 'Status: WebSocket error';
-        };
-        
-        async function startConversation() {
-            try {
-                // Get microphone access
-                audioStream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }, 
-                    video: false 
-                });
-                
-                // Create peer connection
-                peerConnection = new RTCPeerConnection({
-                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-                });
-                
-                // Add audio track to peer connection
-                audioStream.getAudioTracks().forEach(track => {
-                    peerConnection.addTrack(track, audioStream);
-                });
-                
-                // Handle ICE candidates
-                peerConnection.onicecandidate = (event) => {
-                    if (event.candidate) {
-                        ws.send(JSON.stringify({
-                            type: 'ice_candidate',
-                            data: {
-                                candidate: event.candidate.candidate,
-                                sdpMid: event.candidate.sdpMid,
-                                sdpMLineIndex: event.candidate.sdpMLineIndex
-                            },
-                            session_id: sessionId
-                        }));
-                    }
-                };
-                
-                // Handle incoming tracks
-                peerConnection.ontrack = (event) => {
-                    console.log('Received remote track:', event.track);
-                    if (event.track.kind === 'audio') {
-                        const audioElement = new Audio();
-                        audioElement.srcObject = new MediaStream([event.track]);
-                        audioElement.play();
-                    }
-                };
-                
-                // ICE connection state change
-                peerConnection.oniceconnectionstatechange = () => {
-                    console.log('ICE connection state:', peerConnection.iceConnectionState);
-                    if (peerConnection.iceConnectionState === 'connected') {
-                        statusDiv.textContent = 'Status: Connected';
-                    } else if (peerConnection.iceConnectionState === 'disconnected' || 
-                              peerConnection.iceConnectionState === 'failed') {
-                        statusDiv.textContent = 'Status: Disconnected';
-                        stopConversation();
-                    }
-                };
-                
-                // Create offer
-                const offer = await peerConnection.createOffer({
-                    offerToReceiveAudio: true,
-                    offerToReceiveVideo: false
-                });
-                await peerConnection.setLocalDescription(offer);
-                
-                // Send offer to server
-                ws.send(JSON.stringify({
-                    type: 'offer',
-                    data: {
-                        sdp: peerConnection.localDescription.sdp,
-                        type: peerConnection.localDescription.type
-                    },
-                    session_id: sessionId
-                }));
-                
-                // Update UI
-                startButton.classList.add('hidden');
-                stopButton.classList.remove('hidden');
-                statusDiv.textContent = 'Status: Connecting...';
-                
-            } catch (error) {
-                console.error('Error starting conversation:', error);
-                statusDiv.textContent = 'Status: Error starting conversation';
-            }
-        }
-        
-        async function handleOffer(answer) {
-            if (!peerConnection) {
-                console.error('PeerConnection not initialized');
-                return;
-            }
-            
-            try {
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-                
-                statusDiv.textContent = 'Status: Connected';
-            } catch (error) {
-                console.error('Error handling offer:', error);
-            }
-        }
-        
-        function stopConversation() {
-            // Close peer connection
-            if (peerConnection) {
-                peerConnection.close();
-                peerConnection = null;
-            }
-            
-            // Stop audio stream
-            if (audioStream) {
-                audioStream.getTracks().forEach(track => track.stop());
-                audioStream = null;
-            }
-            
-            // Update UI
-            startButton.classList.remove('hidden');
-            stopButton.classList.add('hidden');
-            statusDiv.textContent = 'Status: Disconnected';
-        }
-        
-        function generateSessionId() {
-            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-                return v.toString(16);
-            });
-        }
-    </script>
-</body>
-</html>
-"""
-
 # Create template directory and write HTML file
-os.makedirs(TEMPLATES_DIR, exist_ok=True)
-with open(os.path.join(TEMPLATES_DIR, "index.html"), "w") as f:
-    f.write(index_html)
+#os.makedirs(TEMPLATES_DIR, exist_ok=True)
+#with open(os.path.join(TEMPLATES_DIR, "index.html"), "w") as f:
+#    f.write(index_html)
 
 if __name__ == "__main__":
     server = WebRTCServer(inference_server_url="http://localhost:8001")
