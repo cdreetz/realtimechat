@@ -364,52 +364,42 @@ class WebRTCServer:
             if websocket not in self.peer_connections:
                 logger.error("No peer connection for websocket")
                 return
-                
-            # Check if we have an audio processor for this connection
-            if websocket in self.audio_processors:
-                # For now, we just log that we have audio to send
-                # The actual sending happens via the audio processor track
-                logger.info(f"Audio ready to send to client: {len(audio_data)} samples")
-                
-                # The ideal solution would be to queue the audio for playback
-                # through the AudioProcessTrack, but for simplicity, we'll
-                # create synthetic audio frames and send them directly
-                
-                # Convert float32 audio to int16
-                audio_int16 = (audio_data * 32767).astype(np.int16)
-                
-                # Split into chunks of reasonable size
-                chunk_size = 960  # 60ms at 16kHz
-                frame_time = 0
-                
-                for i in range(0, len(audio_int16), chunk_size):
-                    chunk = audio_int16[i:i+chunk_size]
-                    
-                    # Pad the last chunk if needed
-                    if len(chunk) < chunk_size:
-                        chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
-                    
-                    # Create audio frame
-                    frame = AudioFrame(
-                        format="s16",
-                        layout="mono",
-                        samples=chunk_size
-                    )
-                    
-                    frame.sample_rate = 16000
-                    frame.pts = i // chunk_size
-                    frame.time_base = fractions.Fraction(1, 16000)
-                    
-                    # Copy data to frame
-                    frame.planes[0].update(chunk.tobytes())
-                    
-                    # Process frame through the audio processor
-                    # In a real implementation, we would properly mix or queue this audio
-                    await asyncio.sleep(0.06)  # 60ms delay between chunks
-                    
-                logger.info("Finished sending audio to client")
-            else:
-                logger.error("No audio processor for this connection")
+
+            pc = self.peer_connections[websocket]
+
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+
+            if not hasattr(self, 'audio_sender') or not self.audio_sender:
+                audio_track = MediaStreamTrack()
+                audio_track.kind = "audio"
+                self.audio_sender = pc.addTrack(audio_track)
+
+            chunk_size = 960
+
+            for i in range(0, len(audio_int16), chunk_size):
+                chunk = audio_int16[i:i+chunk_size]
+
+                if len(chunk) < chunk_size:
+                    chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+
+                frame = AudioFrame(
+                    format="s16",
+                    layout="mono",
+                    samples=chunk_size
+                )
+
+                frames.sample_rate = 16000
+                frames.pt = i // chunk_size
+                frames.time_base = fractions.Fraction(1, 16000)
+
+                frames.planes[0].update(chunk.tobytes())
+
+                self.audio_sender.track.emit(frame)
+
+                await asyncio.sleep(0.5)
+
+            logger.info("Finished sending audio to client")
+
                 
         except Exception as e:
             logger.error(f"Error sending audio to client: {str(e)}")
