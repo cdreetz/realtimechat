@@ -59,6 +59,7 @@ class AudioProcessTrack(MediaStreamTrack):
         
         # Process audio data
         audio_data = frame.to_ndarray()
+        audio_data = audio_data.flatten()
         self.buffer.append(audio_data)
         self.buffer_duration += frame.samples / frame.sample_rate
         
@@ -156,6 +157,8 @@ class WebRTCServer:
             # Create a new RTCPeerConnection
             pc = RTCPeerConnection()
             self.peer_connections[websocket] = pc
+
+            self.active_connections[websocket]["session_id"] = session_id
             
             # Set up event handlers
             @pc.on("iceconnectionstatechange")
