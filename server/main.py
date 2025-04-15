@@ -380,10 +380,10 @@ class SpeechServer:
             if "[/INST]" in full_response:
                 response = full_response.split("[/INST]")[-1].strip()
             else:
-                response = full_response.split("Assistant:")[-1].strip()
+                response = full_response.split("assistant\n\n")[-1].strip()
 
         else:
-            response = full_response.split("Assistant:")[-1].strip()
+            response = full_response.split("assistant\n\n")[-1].strip()
 
         if response.startswith("system"):
             parts = response.split("assistant", 1)
