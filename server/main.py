@@ -497,6 +497,31 @@ class SpeechServer:
         except Exception as e:
             logger.error(f"Error sending audio chunks: {str(e)}")
 
+    async def text_to_speech_streaming(self, text: str, websocket: WebSocket) -> None:
+        sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
+
+    for i, sentence in enumerate(sentences):
+        logger.info(f"Processing sentence {i+1}/{len(sentences)}")
+
+        audio_generator = self.tts_pipeline(sentence, voice=self.current_voice)
+
+        for _, _, audio in audio_generator:
+            if audio is None or len(audio) == 0:
+                continue
+
+            speech_tensor = audio.unsqueeze(0) if audio.dim() == 1 else audio
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, speech_tensor, sample_rate=24000, format="wav")
+
+            audio_b64 = base64.b64encode(buffer.getvalue()).decode()
+            await websocket.send_json({
+                "type": "audio_response_chunk",
+                "data": audio_b64,
+                "sentence": i+1,
+                "total_sentences": len(sentences),
+                "is_final": (i == len(sentences) - 1)
+            })
+
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
         try:
             message_type = message.get("type")
@@ -539,7 +564,7 @@ class SpeechServer:
                     
                     logger.info("Starting TTS generation...")
                     try:
-                        await self.text_to_speech(response, websocket)
+                        await self.text_to_speech_streaming(response, websocket)
                         logger.info("TTS generation completed")
                     except Exception as e:
                         logger.error(f"Error in TTS generation: {str(e)}")
@@ -554,7 +579,7 @@ class SpeechServer:
                 
                 logger.info("Starting TTS generation for text input...")
                 try:
-                    await self.text_to_speech(response, websocket)
+                    await self.text_to_speech_streaming(response, websocket)
                     logger.info("TTS generation completed")
                 except Exception as e:
                     logger.error(f"Error in TTS generation: {str(e)}")
