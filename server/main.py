@@ -554,7 +554,7 @@ class SpeechServer:
                 
                 logger.info("Starting TTS generation for text input...")
                 try:
-                    await self.text_to_speech(response, session_id)
+                    await self.text_to_speech(response, websocket)
                     logger.info("TTS generation completed")
                 except Exception as e:
                     logger.error(f"Error in TTS generation: {str(e)}")
