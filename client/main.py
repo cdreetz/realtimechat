@@ -32,18 +32,19 @@ class AudioProcessor:
     def audio_callback(self, indata, frames, time, status):
         if status:
             logger.warning(f"Audio callback status: {status}")
+
+        audio_level = np.max(np.abs(indata))
+
+        if audio_level > 0.1:
+            if not self.is_hearing_audio:
+                logger.info("Audio started...")
+                self.is_hearing_audio = True
+        elif self.is_hearing_audio:
+            logger.info("Audio ended...")
+            self.is_hearing_audio = False
         
         # Only process input when not playing audio
         if not self.is_playing:
-            audio_level = np.max(np.abs(indata))
-            if audio_level > 0.05:
-                if not self.is_hearing_audio:
-                    logger.info("Audio started...")
-                    self.is_hearing_audio = True
-            elif self.is_hearing_audio:
-                logger.info("Audio ended...")
-                self.is_hearing_audio = False
-            
             self.audio_queue.put(indata.copy())
 
     def start_recording(self):
@@ -110,7 +111,7 @@ class SpeechClient:
         else:
             logger.error("Failed to send interrupt signal")
 
-        return sucess
+        return success
         
     async def ensure_connection(self):
         async with self._connection_lock:
