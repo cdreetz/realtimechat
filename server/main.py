@@ -62,6 +62,7 @@ class SpeechServer:
         self.setup_cors()
         self.setup_routes()
         self.manager = ConnectionManager()
+        self.interruption_flags = {}
         
         # Add model options
         self.available_language_models = {
@@ -498,6 +499,9 @@ class SpeechServer:
             logger.error(f"Error sending audio chunks: {str(e)}")
 
     async def text_to_speech_streaming(self, text: str, websocket: WebSocket) -> None:
+        if websocket not in self.interruption_flags:
+            self.interruption_flags[websocket] = False
+
         text = text.replace("...", ".").replace("..", ".")  # Fix multiple periods
         text = " ".join(text.split())  # Normalize whitespace
 
@@ -507,10 +511,22 @@ class SpeechServer:
         for i, sentence in enumerate(sentences):
             logger.info(f"Processing sentence {i+1}/{len(sentences)}")
 
+            if self.interruption_flags.get(websocket, False):
+                logger.info("TTS generation interrupted by user")
+                await websocket.send_json({
+                    "text": "generation_stopped",
+                    "data": "Speech generation stopped due to interruption"
+                })
+                return
+
             try:
                 audio_generator = self.tts_pipeline(sentence, voice=self.current_voice)
 
                 for _, _, audio in audio_generator:
+                    if self.interruption_flags.get(websocket, False):
+                        logger.info("TTS generation interrupted during processing")
+                        return 
+
                     if audio is None or len(audio) == 0:
                         logger.error("Generated audio is empty")
                         continue
@@ -535,16 +551,34 @@ class SpeechServer:
                         "is_final": (i == total_chunks - 1)
                     })
 
+                    if self.interruption_flags.get(websocket, False):
+                        logger.info("TTS generation interrupted after sending chunk")
+                        return
+
                     logger.info(f"Sent sentence chunk {i+1}/{total_chunks}")
 
             except Exception as e:
                 logger.error(f"Error processing sentence {i}: {str(e)}")
-                continue
+                if not self.interruption_flags.get(websocket, False):
+                    continue
+                else:
+                    return
 
     async def handle_websocket_message(self, websocket: WebSocket, message: dict):
         try:
             message_type = message.get("type")
             data = message.get("data")
+            if message_type == "interrupt":
+                logger.info("Received interruption request")
+                self.interruption_flags[websocket] = True
+                await websocket.send_json({
+                    "type": "interrupted",
+                    "data": "Speech generation interrupted"
+                })
+                return
+
+            self.interruption_flags[websocket] = False
+
             session_id = websocket.session_id
             
             if message_type == "audio":
@@ -620,6 +654,7 @@ class SpeechServer:
         # Clean up chat history when client disconnects
         if hasattr(websocket, 'session_id') and websocket.session_id in self.chat_histories:
             self.chat_histories.pop(websocket.session_id, None)
+        self.interruption_flags.pop(websocket, None)
         self.active_connections.remove(websocket)
         self.last_activity.pop(websocket, None)
 

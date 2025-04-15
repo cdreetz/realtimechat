@@ -93,6 +93,24 @@ class SpeechClient:
         self.last_audio_time = None  # Track when we last detected significant audio
         self.silence_threshold = 1.0  # Wait for 1 second of silence before sending
         self._connection_lock = asyncio.Lock()
+        self.is_interrupting = False
+
+    async def send_interrupt(self):
+        logger.info("Sending interrupt signal")
+        self.is_interrupting = True
+
+        message = {
+            "type": "interrupt",
+            "data": "User interrupted"
+        }
+        success = await self.send_message(message)
+
+        if success:
+            logger.info("Interrupt signal sent successfully")
+        else:
+            logger.error("Failed to send interrupt signal")
+
+        return sucess
         
     async def ensure_connection(self):
         async with self._connection_lock:
@@ -166,8 +184,14 @@ class SpeechClient:
                 
                 elif data["type"] == "chat_response":
                     logger.info(f"Assistant: {data['data']}")
+
+                elif data["type"] == "interrupted" or data["type"] == "generation_stopped":
+                    logger.info("Speech generation interrupted")
+                    audio_chunks.clear()
+                    self.is_interrupting = False
+                    self.audio_processor.is_playing = False
                 
-                elif data["type"] == "audio_response_chunk":
+                elif data["type"] == "audio_response_chunk" and not self.is_interrupting:
                     # Create storage for this chunk if it doesn't exist
                     chunk_id = data["chunk"]
                     if chunk_id not in audio_chunks:
@@ -179,6 +203,9 @@ class SpeechClient:
                     # Check if we have all sub-chunks for this chunk
                     if None not in audio_chunks[chunk_id]:
                         try:
+                            if self.is_interrupting:
+                                continue
+
                             # Set playing flag before playing audio
                             self.audio_processor.is_playing = True
                             
@@ -189,7 +216,18 @@ class SpeechClient:
                             audio_data = io.BytesIO(full_chunk)
                             audio_array, samplerate = sf.read(audio_data)
                             sd.play(audio_array, samplerate)
-                            sd.wait()  # Wait for this chunk to finish playing
+
+                            start_time = time.time()
+                            while sd.get_stream().active and time.time() - start_time < 30:
+                                if self.audio_processor.is_hearing_audio and not self.is_interrupting:
+                                    logger.info("Heard user audio during playback, interrupting..")
+                                    sd.stop()
+                                    await self.send_interrupt()
+                                    break
+
+                                if self.is_interrupting:
+                                    sd.stop()
+                                    break
                             
                             # Add a small delay after playback
                             await asyncio.sleep(0.1)
@@ -302,6 +340,8 @@ class CLI:
                 if line.startswith('text:'):
                     text = line[5:].strip()
                     await self.client.send_text(text)
+                elif line.strip().lower() in ['stop', 'interrupt', 'i']:
+                    await self.client.send_interrupt()
             except EOFError:
                 break
             except Exception as e:
@@ -311,6 +351,7 @@ class CLI:
         print("Starting interactive mode...")
         print("Press Ctrl+C to exit")
         print("Type 'text: your message' to send text directly")
+        print("Type 'stop', or 'interrupt' or 'i' to interrupt ongoing speech")
 
         try:
             input_task = asyncio.create_task(self.handle_input())
