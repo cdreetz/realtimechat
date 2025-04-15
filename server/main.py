@@ -176,8 +176,8 @@ class SpeechServer:
             import subprocess
             result = subprocess.run(['which', 'espeak-ng'], capture_output=True, text=True)
             if not result.stdout.strip():
-            print("Installing espeak-ng...")
-            os.system('apt-get -qq -y install espeak-ng > /dev/null 2>&1')
+                print("Installing espeak-ng...")
+                os.system('apt-get -qq -y install espeak-ng > /dev/null 2>&1')
         except Exception as e:
             print(f"Error checking/installing espeak-ng: {str(e)}")
         
