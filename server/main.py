@@ -375,6 +375,7 @@ class SpeechServer:
         )
         
         full_response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logger.info(f"Full output: ", full_response)
         if "llama" in self.current_language_model:
             if "[/INST]" in full_response:
                 response = full_response.split("[/INST]")[-1].strip()
@@ -389,9 +390,6 @@ class SpeechServer:
             if len(parts) > 1:
                 response=parts[1].strip()
 
-        if "user" in response:
-            parts = response.split("user", 1)
-            response = parts[0].strip()
         
         # Add assistant response to history
         self.chat_histories[session_id].append({"role": "assistant", "content": response})
