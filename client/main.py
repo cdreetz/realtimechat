@@ -48,13 +48,21 @@ class AudioProcessor:
 
     def start_recording(self):
         self.is_recording = True
+
+        input_devices = []
+        for i, device in enumerate(sd.query_devices()):
+            if device['max_input_channels'] > 0:
+                input_devices.append((i, device))
+
+        if not input_devices:
+            raise ValueError("No input devices found")
         
-        device_info = sd.query_devices(1, 'input')
+        device_idx, device_info = input_devices[0]
         logger.info(f"Using input device: {device_info['name']}")  # Only log device name
         
         # Force 16kHz sample rate for speech recognition
         self.stream = sd.InputStream(
-            device=1,
+            device=device_idx,
             channels=self.channels,
             samplerate=16000,  # Force 16kHz
             dtype=self.dtype,

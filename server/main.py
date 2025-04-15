@@ -510,7 +510,7 @@ class SpeechServer:
                         "data": text
                     })
                     
-                    response = await self.generate_chat_response(text, websocket)
+                    response = await self.generate_chat_response(text, session_id)
                     
                     # Add conversation context to avoid repetitive responses
                     #if hasattr(self, 'last_response') and response == self.last_response:
@@ -542,7 +542,7 @@ class SpeechServer:
                 
                 logger.info("Starting TTS generation for text input...")
                 try:
-                    await self.text_to_speech(response, websocket)
+                    await self.text_to_speech(response, session_id)
                     logger.info("TTS generation completed")
                 except Exception as e:
                     logger.error(f"Error in TTS generation: {str(e)}")
