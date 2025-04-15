@@ -321,8 +321,6 @@ class SpeechServer:
             
             conversation += "Assistant:"
         
-        inputs = self.chat_tokenizer(conversation, return_length=True)
-
         # Check token count and trim history if needed
         #while inputs.length[0] > self.max_history_tokens and len(self.chat_histories[websocket]) > 2:
         #    # Always keep system prompt and remove oldest message pair
@@ -376,8 +374,24 @@ class SpeechServer:
             repetition_penalty=1.2
         )
         
-        response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response = response.split("Assistant:")[-1].strip()
+        full_response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if "llama" in self.current_language_model:
+            if "[/INST]" in full_response:
+                response = full_response.split("[/INST]")[-1].strip()
+            else:
+                response = full_response.split("Assistant:")[-1].strip()
+
+        else:
+            response = full_response.split("Assistant:")[-1].strip()
+
+        if response.startswith("system"):
+            parts = response.split("assistant", 1)
+            if len(parts) > 1:
+                response=parts[1].strip()
+
+        if "user" in response:
+            parts = response.split("user", 1)
+            response = parts[0].strip()
         
         # Add assistant response to history
         self.chat_histories[session_id].append({"role": "assistant", "content": response})
