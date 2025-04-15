@@ -94,7 +94,8 @@ class SpeechServer:
         # self.tts_model = "microsoft/speecht5_tts"
         
         # Add chat history management
-        self.chat_histories = {}  # Keyed by websocket
+        self.chat_histories = {}  # Keyed by session id
+        self.session_counter = 0
         self.max_history_tokens = 2048  # Adjust based on your model's context window
         
         # System prompt to use for all conversations
@@ -197,6 +198,15 @@ class SpeechServer:
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
             await self.manager.connect(websocket)
+            session_id = str(self.session_counter)
+            self.session_counter += 1
+
+            self.chat_histories[session_id] = [
+                {"role": "system", "content": self.system_prompt}
+            ]
+
+            websocket.session_id = session_id
+
             try:
                 while True:
                     try:
@@ -276,43 +286,30 @@ class SpeechServer:
         logger.info(f"Transcribed: {transcription}")
         return transcription
 
-    async def generate_chat_response(self, text: str, websocket: WebSocket) -> str:
+    async def generate_chat_response(self, text: str, session_id: str) -> str:
         logger.info("Generating response...")
         
         # Initialize chat history for new connections
-        if websocket not in self.chat_histories:
-            self.chat_histories[websocket] = [
-                {"role": "system", "content": self.system_prompt}
-            ]
+        #if websocket not in self.chat_histories:
+        #    self.chat_histories[websocket] = [
+        #        {"role": "system", "content": self.system_prompt}
+        #    ]
         
         # Add user message to history
-        self.chat_histories[websocket].append({"role": "user", "content": text})
+        self.chat_histories[session_id].append({"role": "user", "content": text})
         
         # Construct the full conversation history
-        conversation = ""
-        for message in self.chat_histories[websocket]:
-            role = message["role"]
-            content = message["content"]
-            if role == "system":
-                conversation += f"{content}\n\n"
-            elif role == "user":
-                conversation += f"User: {content}\n"
-            elif role == "assistant":
-                conversation += f"Assistant: {content}\n"
-        
-        conversation += "Assistant:"
-        
-        # Check token count and trim history if needed
-        inputs = self.chat_tokenizer(conversation, return_length=True)
-        while inputs.length[0] > self.max_history_tokens and len(self.chat_histories[websocket]) > 2:
-            # Always keep system prompt and remove oldest message pair
-            self.chat_histories[websocket] = (
-                [self.chat_histories[websocket][0]] +  # Keep system prompt
-                self.chat_histories[websocket][3:]      # Remove oldest user+assistant pair
+        if "llama" in self.current_language_model:
+            messages = self.chat_histories[session_id].copy()
+
+            conversation = self.chat_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
-            # Reconstruct conversation with trimmed history
+        else:
             conversation = ""
-            for message in self.chat_histories[websocket]:
+            for message in self.chat_histories[session_id]:
                 role = message["role"]
                 content = message["content"]
                 if role == "system":
@@ -321,8 +318,40 @@ class SpeechServer:
                     conversation += f"User: {content}\n"
                 elif role == "assistant":
                     conversation += f"Assistant: {content}\n"
+            
             conversation += "Assistant:"
-            inputs = self.chat_tokenizer(conversation, return_length=True)
+        
+        inputs = self.chat_tokenizer(conversation, return_length=True)
+
+        # Check token count and trim history if needed
+        #while inputs.length[0] > self.max_history_tokens and len(self.chat_histories[websocket]) > 2:
+        #    # Always keep system prompt and remove oldest message pair
+        #    self.chat_histories[session_id] = (
+        #        [self.chat_histories[session_id][0]] +  # Keep system prompt
+        #        self.chat_histories[session_id][3:]      # Remove oldest user+assistant pair
+        #    )
+
+        #    if "llama" in self.current_language_model:
+        #        messages = self.chat_histories[session_id].copy()
+        #        conversation = self.chat_tokenizer.apply_chat_template(
+        #            messages,
+        #            tokenize=False,
+        #            add_generation_prompt=True
+        #        )
+        #    else:
+        #        # Reconstruct conversation with trimmed history
+        #        conversation = ""
+        #        for message in self.chat_histories[websocket]:
+        #            role = message["role"]
+        #            content = message["content"]
+        #            if role == "system":
+        #                conversation += f"{content}\n\n"
+        #            elif role == "user":
+        #                conversation += f"User: {content}\n"
+        #            elif role == "assistant":
+        #                conversation += f"Assistant: {content}\n"
+        #        conversation += "Assistant:"
+        #    inputs = self.chat_tokenizer(conversation, return_length=True)
         
         # Generate response with the conversation history
         inputs = self.chat_tokenizer(
@@ -351,7 +380,7 @@ class SpeechServer:
         response = response.split("Assistant:")[-1].strip()
         
         # Add assistant response to history
-        self.chat_histories[websocket].append({"role": "assistant", "content": response})
+        self.chat_histories[session_id].append({"role": "assistant", "content": response})
         
         logger.info(f"Generated response: {response}")
         return response
@@ -460,22 +489,19 @@ class SpeechServer:
         try:
             message_type = message.get("type")
             data = message.get("data")
+            session_id = websocket.session_id
             
             if message_type == "audio":
-                # Decode base64 audio data
                 audio_bytes = base64.b64decode(data)
                 audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
                 
-                # Add minimum length check
-                if len(audio_array) < 2048:  # Adjust this value based on your needs
+                # minimum length check
+                if len(audio_array) < 2048:  
                     return
                 
-                # Check for speech
                 if await self.detect_speech(audio_array):
-                    # Convert speech to text
                     text = await self.speech_to_text(audio_array)
                     
-                    # Skip empty or very short transcriptions
                     if not text or len(text.strip()) <= 1:
                         return
                         
@@ -484,13 +510,12 @@ class SpeechServer:
                         "data": text
                     })
                     
-                    # Generate response
                     response = await self.generate_chat_response(text, websocket)
                     
                     # Add conversation context to avoid repetitive responses
-                    if hasattr(self, 'last_response') and response == self.last_response:
-                        return
-                    self.last_response = response
+                    #if hasattr(self, 'last_response') and response == self.last_response:
+                    #    return
+                    #self.last_response = response
                     
                     try:
                         await websocket.send_json({
@@ -500,7 +525,6 @@ class SpeechServer:
                     except Exception as e:
                         logger.error(f"Error sending chat response: {e}")
                     
-                    # Add logging for audio generation
                     logger.info("Starting TTS generation...")
                     try:
                         await self.text_to_speech(response, websocket)
@@ -510,14 +534,12 @@ class SpeechServer:
                         return
             
             elif message_type == "text":
-                # Direct text input
-                response = await self.generate_chat_response(data, websocket)
+                response = await self.generate_chat_response(data, session_id)
                 await websocket.send_json({
                     "type": "chat_response",
                     "data": response
                 })
                 
-                # Add logging for audio generation
                 logger.info("Starting TTS generation for text input...")
                 try:
                     await self.text_to_speech(response, websocket)
@@ -540,7 +562,8 @@ class SpeechServer:
 
     def disconnect(self, websocket: WebSocket):
         # Clean up chat history when client disconnects
-        self.chat_histories.pop(websocket, None)
+        if hasattr(websocket, 'session_id') and websocket.session_id in self.chat_histories:
+            self.chat_histories.pop(websocket.session_id, None)
         self.active_connections.remove(websocket)
         self.last_activity.pop(websocket, None)
 
