@@ -530,6 +530,8 @@ class SpeechServer:
                         "data": audio_b64,
                         "chunk": i,
                         "total_chunks": total_chunks,
+                        "sub_chunk": 0,
+                        "total_sub_chunks": 1,
                         "is_final": (i == total_chunks - 1)
                     })
 
