@@ -375,7 +375,7 @@ class SpeechServer:
         )
         
         full_response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logger.info(f"Full output: ", full_response)
+        logger.info(f"Full output: {full_response}")
         if "llama" in self.current_language_model:
             if "[/INST]" in full_response:
                 response = full_response.split("[/INST]")[-1].strip()
