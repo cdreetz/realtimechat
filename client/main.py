@@ -1,382 +1,304 @@
+#!/usr/bin/env python3
+"""Realtime speech client.
+
+Streams mic audio (16 kHz float32) to the server continuously; the server does
+VAD/endpointing. Plays back streamed TTS audio (24 kHz float32) through a
+persistent output stream for gapless playback.
+
+Barge-in: while the assistant is playing, mic audio is not forwarded (echo
+control), but the local level is monitored. Sustained sound stops playback,
+sends an interrupt, and forwards the buffered onset of your speech.
+
+Also accepts typed input: plain text sends a text turn, "i"/"stop" interrupts,
+"/v <voice>" switches voice, "/q" quits.
+"""
+import argparse
 import asyncio
-import websockets
-import sounddevice as sd
-import numpy as np
-import json
 import base64
-import soundfile as sf
-import io
-import click
-from queue import Queue
-from threading import Thread
+import json
 import logging
-from datetime import datetime, timedelta
+import sys
+import threading
 import time
+from collections import deque
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import numpy as np
+import sounddevice as sd
+import websockets
 
-class AudioProcessor:
-    def __init__(self, sample_rate=16000, channels=1, dtype=np.float32):
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.dtype = dtype
-        self.audio_queue = Queue()
-        self.is_recording = False
-        self.is_hearing_audio = False
-        self.is_playing = False  # Add flag to track when we're playing audio
-        
-        logger.info("Available audio devices:")
-        logger.info(sd.query_devices())
-        
-    def audio_callback(self, indata, frames, time, status):
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("speech-client")
+
+MIC_SR = 16000
+TTS_SR = 24000
+MIC_BLOCK = 512          # 32 ms at 16 kHz
+BLOCKS_PER_MSG = 4       # 128 ms per websocket message
+
+
+class Player:
+    """Persistent output stream pulling from a chunk queue (gapless playback)."""
+
+    def __init__(self, sr=TTS_SR, device=None):
+        self._lock = threading.Lock()
+        self._chunks = deque()
+        self._pos = 0
+        self._buffered = 0
+        self.stream = sd.OutputStream(
+            samplerate=sr, channels=1, dtype="float32",
+            blocksize=1024, device=device, callback=self._callback)
+
+    def _callback(self, outdata, frames, _time, status):
         if status:
-            logger.warning(f"Audio callback status: {status}")
+            logger.debug(f"output status: {status}")
+        filled = 0
+        with self._lock:
+            while filled < frames and self._chunks:
+                cur = self._chunks[0]
+                take = min(frames - filled, len(cur) - self._pos)
+                outdata[filled:filled + take, 0] = cur[self._pos:self._pos + take]
+                self._pos += take
+                filled += take
+                self._buffered -= take
+                if self._pos >= len(cur):
+                    self._chunks.popleft()
+                    self._pos = 0
+        if filled < frames:
+            outdata[filled:, 0] = 0
 
-        audio_level = np.max(np.abs(indata))
+    def write(self, pcm: np.ndarray):
+        with self._lock:
+            self._chunks.append(pcm)
+            self._buffered += len(pcm)
 
-        if audio_level > 0.1:
-            if not self.is_hearing_audio:
-                logger.info("Audio started...")
-                self.is_hearing_audio = True
-        elif self.is_hearing_audio:
-            logger.info("Audio ended...")
-            self.is_hearing_audio = False
-        
-        # Only process input when not playing audio
-        if not self.is_playing:
-            self.audio_queue.put(indata.copy())
+    def clear(self):
+        with self._lock:
+            self._chunks.clear()
+            self._pos = 0
+            self._buffered = 0
 
-    def start_recording(self):
-        self.is_recording = True
+    @property
+    def playing(self) -> bool:
+        with self._lock:
+            return self._buffered > 0
 
-        input_devices = []
-        for i, device in enumerate(sd.query_devices()):
-            if device['max_input_channels'] > 0:
-                input_devices.append((i, device))
-
-        if not input_devices:
-            raise ValueError("No input devices found")
-        
-        device_idx, device_info = input_devices[0]
-        logger.info(f"Using input device: {device_info['name']}")  # Only log device name
-        
-        # Force 16kHz sample rate for speech recognition
-        self.stream = sd.InputStream(
-            device=device_idx,
-            channels=self.channels,
-            samplerate=16000,  # Force 16kHz
-            dtype=self.dtype,
-            callback=self.audio_callback,
-            blocksize=1024
-        )
+    def start(self):
         self.stream.start()
-        logger.info("Listening...")
 
-    def stop_recording(self):
-        self.is_recording = False
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
+    def stop(self):
+        self.stream.stop()
+        self.stream.close()
 
-    def get_audio_chunk(self, timeout=0.1):
-        try:
-            return self.audio_queue.get(timeout=timeout)
-        except:
-            return None
 
 class SpeechClient:
-    def __init__(self, server_url):
-        self.server_url = server_url.replace('http', 'ws') + '/ws'
-        self.audio_processor = AudioProcessor()
-        self.websocket = None
-        self.running = False
-        self.last_audio_time = None  # Track when we last detected significant audio
-        self.silence_threshold = 1.0  # Wait for 1 second of silence before sending
-        self._connection_lock = asyncio.Lock()
-        self.is_interrupting = False
-
-    async def send_interrupt(self):
-        logger.info("Sending interrupt signal")
-        self.is_interrupting = True
-
-        message = {
-            "type": "interrupt",
-            "data": "User interrupted"
-        }
-        success = await self.send_message(message)
-
-        if success:
-            logger.info("Interrupt signal sent successfully")
-        else:
-            logger.error("Failed to send interrupt signal")
-
-        return success
-        
-    async def ensure_connection(self):
-        async with self._connection_lock:
-            try:
-                if self.websocket is None:
-                    self.websocket = await websockets.connect(self.server_url)
-                    logger.info("Connected to speech server")
-                await self.websocket.ping()
-                return True
-            except Exception as e:
-                logger.error(f"Failed to connect to server: {e}")
-                self.websocket = None
-                return False
-
-    async def send_message(self, message):
-        if not await self.ensure_connection():
-            return False
-        
-        try:
-            await self.websocket.send(json.dumps(message))
-            return True
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error while sending: {e}")
-            self.websocket = None
-            return False
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            return False
-
-    async def send_audio(self, audio_data):
-        # Ensure audio data is in float32 format and normalized
-        if audio_data.dtype != np.float32:
-            audio_data = audio_data.astype(np.float32)
-        
-        # Ensure audio is normalized between -1 and 1
-        if np.max(np.abs(audio_data)) > 1.0:
-            audio_data = audio_data / np.max(np.abs(audio_data))
-        
-        message = {
-            "type": "audio",
-            "data": base64.b64encode(audio_data.tobytes()).decode(),
-            "sample_rate": self.audio_processor.sample_rate,
-            "channels": self.audio_processor.channels
-        }
-        success = await self.send_message(message)
-        if success:
-            logger.debug("Audio chunk sent successfully")
-        return success
-
-    async def send_text(self, text):
-        message = {
-            "type": "text",
-            "data": text
-        }
-        return await self.send_message(message)
-
-    async def handle_server_messages(self):
-        audio_chunks = {}
-        
-        while self.running:
-            try:
-                if not await self.ensure_connection():
-                    await asyncio.sleep(1)
-                    continue
-
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                if data["type"] == "transcription":
-                    logger.info(f"Transcription: {data['data']}")
-                
-                elif data["type"] == "chat_response":
-                    logger.info(f"Assistant: {data['data']}")
-
-                elif data["type"] == "interrupted" or data["type"] == "generation_stopped":
-                    logger.info("Speech generation interrupted")
-                    audio_chunks.clear()
-                    self.is_interrupting = False
-                    self.audio_processor.is_playing = False
-                
-                elif data["type"] == "audio_response_chunk" and not self.is_interrupting:
-                    # Create storage for this chunk if it doesn't exist
-                    chunk_id = data["chunk"]
-                    if chunk_id not in audio_chunks:
-                        audio_chunks[chunk_id] = [None] * data["total_sub_chunks"]
-                    
-                    # Store this sub-chunk
-                    audio_chunks[chunk_id][data["sub_chunk"]] = data["data"]
-                    
-                    # Check if we have all sub-chunks for this chunk
-                    if None not in audio_chunks[chunk_id]:
-                        try:
-                            if self.is_interrupting:
-                                continue
-
-                            # Set playing flag before playing audio
-                            self.audio_processor.is_playing = True
-                            
-                            # Combine all sub-chunks
-                            full_chunk = b''.join([base64.b64decode(chunk) for chunk in audio_chunks[chunk_id]])
-                            
-                            # Convert to audio and play
-                            audio_data = io.BytesIO(full_chunk)
-                            audio_array, samplerate = sf.read(audio_data)
-                            sd.play(audio_array, samplerate)
-
-                            start_time = time.time()
-                            while sd.get_stream().active and time.time() - start_time < 30:
-                                if self.audio_processor.is_hearing_audio and not self.is_interrupting:
-                                    logger.info("Heard user audio during playback, interrupting..")
-                                    sd.stop()
-                                    await self.send_interrupt()
-                                    break
-
-                                if self.is_interrupting:
-                                    sd.stop()
-                                    break
-                            
-                            # Add a small delay after playback
-                            await asyncio.sleep(0.1)
-                            
-                        finally:
-                            # Reset playing flag after audio is done
-                            self.audio_processor.is_playing = False
-                        
-                        # Clean up if this was the final chunk
-                        if data.get("is_final", False):
-                            audio_chunks.clear()
-                        else:
-                            # Remove this chunk's data to free memory
-                            del audio_chunks[chunk_id]
-                
-                elif data["type"] == "error":
-                    logger.error(f"Server error: {data['data']}")
-
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket connection closed")
-                self.websocket = None
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Error handling server message: {e}")
-                await asyncio.sleep(1)
-
-    async def process_audio(self):
-        chunks = []
-        total_frames = 0
-        self.last_audio_time = None
-        
-        while self.running:
-            try:
-                chunk = self.audio_processor.get_audio_chunk()
-                
-                if chunk is not None:
-                    # Check audio level
-                    audio_level = np.max(np.abs(chunk))
-                    current_time = time.time()
-                    
-                    # Update last_audio_time if we detect significant audio
-                    if audio_level > 0.01:  # Adjust this threshold as needed
-                        self.last_audio_time = current_time
-                    
-                    # Amplify the audio signal
-                    chunk = chunk * 5.0  # Increase volume
-                    chunks.append(chunk)
-                    total_frames += len(chunk)
-                    
-                    # Only send audio if we have enough data and silence
-                    if (total_frames >= self.audio_processor.sample_rate * 0.5 and 
-                        (self.last_audio_time is None or 
-                         current_time - self.last_audio_time > self.silence_threshold)):
-                        
-                        if chunks:  # Make sure we have audio to send
-                            audio_data = np.concatenate(chunks)
-                            logger.debug(f"Sending audio chunk: shape={audio_data.shape}")  # Move to debug level
-                            await self.send_audio(audio_data)
-                            chunks = []
-                            total_frames = 0
-                            self.last_audio_time = None  # Reset the timer
-                
-                await asyncio.sleep(0.01)
-            except Exception as e:
-                logger.error(f"Error processing audio: {e}")
-                await asyncio.sleep(0.1)
-
-    async def start(self):
-        self.running = True
-        
-        # Start recording audio
-        self.audio_processor.start_recording()
-
-        # Create tasks for processing audio and handling messages
-        tasks = [
-            asyncio.create_task(self.process_audio()),
-            asyncio.create_task(self.handle_server_messages())
-        ]
-
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            logger.info("Tasks cancelled")
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}")
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await self.stop()
-
-    async def stop(self):
-        self.running = False
-        self.audio_processor.stop_recording()
-        if self.websocket is not None:
-            try:
-                await self.websocket.close()
-            except:
-                pass
-        self.websocket = None
-
-class CLI:
-    def __init__(self, server_url):
-        self.client = SpeechClient(server_url)
-
-    async def handle_input(self):
-        while True:
-            try:
-                line = await asyncio.get_event_loop().run_in_executor(None, input)
-                if line.startswith('text:'):
-                    text = line[5:].strip()
-                    await self.client.send_text(text)
-                elif line.strip().lower() in ['stop', 'interrupt', 'i']:
-                    await self.client.send_interrupt()
-            except EOFError:
+    def __init__(self, server_url, barge_rms=0.06, input_device=None,
+                 output_device=None, no_mic=False):
+        url = server_url.rstrip("/")
+        for prefix, repl in (("https", "wss"), ("http", "ws")):
+            if url.startswith(prefix + "://"):
+                url = repl + url[len(prefix):]
                 break
-            except Exception as e:
-                logger.error(f"Error handling input: {e}")
+        self.url = url + "/ws"
+        self.barge_rms = barge_rms
+        self.input_device = input_device
+        self.output_device = output_device
+        self.no_mic = no_mic
+        self.ws = None
+        self.running = False
+        self.player = Player(device=output_device)
+        self.mic_q = None
+        self.loop = None
+        self.interrupted_utts = set()
+        self.assistant_line_open = False
+
+    # --- mic capture -> asyncio queue ---
+
+    def _mic_callback(self, indata, _frames, _time, status):
+        if status:
+            logger.debug(f"input status: {status}")
+        block = indata[:, 0].copy()
+        self.loop.call_soon_threadsafe(self.mic_q.put_nowait, block)
+
+    async def send(self, msg: dict):
+        await self.ws.send(json.dumps(msg))
+
+    async def send_audio(self, pcm: np.ndarray):
+        await self.send({
+            "type": "audio",
+            "data": base64.b64encode(pcm.astype(np.float32).tobytes()).decode(),
+        })
+
+    async def mic_sender(self):
+        pre_roll = deque(maxlen=int(1.0 * MIC_SR / MIC_BLOCK))  # ~1s
+        loud_run = 0
+        batch = []
+        while self.running:
+            block = await self.mic_q.get()
+
+            if self.player.playing:
+                # Echo control: don't forward mic while assistant audio plays,
+                # but watch for the user talking over it.
+                batch.clear()
+                pre_roll.append(block)
+                rms = float(np.sqrt(np.mean(block ** 2)))
+                loud_run = loud_run + 1 if rms > self.barge_rms else 0
+                if loud_run >= 5:  # ~160 ms of sustained sound
+                    self._print("\n[barge-in]")
+                    self.player.clear()
+                    await self.send({"type": "interrupt"})
+                    onset = np.concatenate(list(pre_roll))
+                    pre_roll.clear()
+                    loud_run = 0
+                    await self.send_audio(onset)
+                continue
+
+            if pre_roll:
+                pre_roll.clear()  # stale audio from playback period; drop it
+                loud_run = 0
+
+            batch.append(block)
+            if len(batch) >= BLOCKS_PER_MSG:
+                await self.send_audio(np.concatenate(batch))
+                batch = []
+
+    # --- server messages ---
+
+    def _print(self, text, end="\n"):
+        if self.assistant_line_open and end == "\n":
+            sys.stdout.write("\n")
+            self.assistant_line_open = False
+        sys.stdout.write(text + end)
+        sys.stdout.flush()
+
+    async def receiver(self):
+        async for raw in self.ws:
+            msg = json.loads(raw)
+            mtype = msg.get("type")
+
+            if mtype == "ready":
+                self._print(f"[connected] llm={msg['llm_model']} "
+                            f"voices={','.join(msg['voices'][:4])}...")
+            elif mtype == "transcription":
+                self._print(f"you: {msg['data']}")
+            elif mtype == "chat_chunk":
+                if msg.get("utt") in self.interrupted_utts:
+                    continue
+                prefix = "" if self.assistant_line_open else "assistant: "
+                sys.stdout.write(prefix + msg["data"] + " ")
+                sys.stdout.flush()
+                self.assistant_line_open = True
+            elif mtype == "audio_chunk":
+                if msg.get("utt") in self.interrupted_utts or not msg.get("pcm"):
+                    continue
+                pcm = np.frombuffer(base64.b64decode(msg["pcm"]), dtype=np.float32)
+                self.player.write(pcm.copy())
+            elif mtype == "chat_done":
+                self._print(f"[first token {msg.get('t_first_token_ms')}ms, "
+                            f"first audio {msg.get('t_first_audio_ms')}ms]")
+            elif mtype == "interrupted":
+                self.interrupted_utts.add(msg.get("utt"))
+                self.player.clear()
+                self._print("[interrupted]")
+            elif mtype == "vad":
+                logger.debug(f"vad: {msg['data']}")
+            elif mtype == "voice_changed":
+                self._print(f"[voice: {msg['data']}]")
+            elif mtype == "error":
+                self._print(f"[server error] {msg['data']}")
+
+    # --- typed input ---
+
+    async def repl(self):
+        loop = asyncio.get_running_loop()
+        while self.running:
+            try:
+                line = await loop.run_in_executor(None, input)
+            except (EOFError, KeyboardInterrupt):
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line.lower() in ("i", "stop", "interrupt"):
+                self.player.clear()
+                await self.send({"type": "interrupt"})
+            elif line.startswith("/v "):
+                await self.send({"type": "set_voice", "data": line[3:].strip()})
+            elif line in ("/q", "/quit", "exit"):
+                self.running = False
+                break
+            else:
+                self._print(f"you (text): {line}")
+                await self.send({"type": "text", "data": line})
 
     async def run(self):
-        print("Starting interactive mode...")
-        print("Press Ctrl+C to exit")
-        print("Type 'text: your message' to send text directly")
-        print("Type 'stop', or 'interrupt' or 'i' to interrupt ongoing speech")
+        self.loop = asyncio.get_running_loop()
+        self.mic_q = asyncio.Queue()
+        self.running = True
 
-        try:
-            input_task = asyncio.create_task(self.handle_input())
-            client_task = asyncio.create_task(self.client.start())
-            
-            await asyncio.gather(input_task, client_task)
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-        except Exception as e:
-            logger.error(f"Error in CLI: {e}")
-        finally:
-            await self.client.stop()
+        self._print(f"connecting to {self.url} ...")
+        async with websockets.connect(self.url, max_size=None) as ws:
+            self.ws = ws
+            self.player.start()
 
-@click.command()
-@click.option('--server', default='http://localhost:8000', 
-              help='Speech server URL (default: http://localhost:8000)')
-@click.option('--debug/--no-debug', default=False,
-              help='Enable debug logging')
-def main(server, debug):
-    if debug:
+            mic_stream = None
+            if not self.no_mic:
+                mic_stream = sd.InputStream(
+                    samplerate=MIC_SR, channels=1, dtype="float32",
+                    blocksize=MIC_BLOCK, device=self.input_device,
+                    callback=self._mic_callback)
+                mic_stream.start()
+                self._print("[mic live] talk, or type a message "
+                            "(i=interrupt, /v <voice>, /q=quit)")
+            else:
+                self._print("[text mode] type a message (/q to quit)")
+
+            tasks = [asyncio.create_task(self.receiver()),
+                     asyncio.create_task(self.repl())]
+            if mic_stream:
+                tasks.append(asyncio.create_task(self.mic_sender()))
+            try:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                for t in done:
+                    if t.exception():
+                        raise t.exception()
+            finally:
+                self.running = False
+                if mic_stream:
+                    mic_stream.stop()
+                    mic_stream.close()
+                self.player.stop()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--server", default="http://localhost:8000",
+                   help="server URL (default http://localhost:8000, e.g. via SSH tunnel)")
+    p.add_argument("--barge-rms", type=float, default=0.06,
+                   help="mic RMS threshold to interrupt playback (default 0.06)")
+    p.add_argument("--input-device", type=int, default=None)
+    p.add_argument("--output-device", type=int, default=None)
+    p.add_argument("--no-mic", action="store_true", help="text input only")
+    p.add_argument("--list-devices", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    if args.list_devices:
+        print(sd.query_devices())
+        return
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
-    cli = CLI(server)
-    asyncio.run(cli.run())
+
+    client = SpeechClient(args.server, barge_rms=args.barge_rms,
+                          input_device=args.input_device,
+                          output_device=args.output_device,
+                          no_mic=args.no_mic)
+    try:
+        asyncio.run(client.run())
+    except KeyboardInterrupt:
+        print("\nbye")
+
 
 if __name__ == "__main__":
     main()

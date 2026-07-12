@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Realtime Speech Chat</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #10131a; --panel: #181c26; --panel2: #1f2431; --text: #e8eaf0;
+    --dim: #8b93a7; --accent: #5b8def; --green: #3ecf8e; --red: #f0655a;
+    --amber: #f4b64e; --purple: #b98cf0;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+    height: 100vh; display: flex; flex-direction: column; padding: 16px; gap: 12px;
+  }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 17px; font-weight: 650; margin-right: 4px; }
+  .pill {
+    padding: 5px 14px; border-radius: 999px; font-weight: 600; font-size: 13px;
+    background: var(--panel2); color: var(--dim); transition: all .15s;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .pill .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+  .pill.listening   { color: var(--green); }  .pill.listening .dot   { background: var(--green); animation: pulse 2s infinite; }
+  .pill.hearing     { color: var(--accent); } .pill.hearing .dot     { background: var(--accent); animation: pulse .5s infinite; }
+  .pill.transcribing{ color: var(--amber); }  .pill.transcribing .dot{ background: var(--amber); animation: pulse .5s infinite; }
+  .pill.thinking    { color: var(--purple); } .pill.thinking .dot    { background: var(--purple); animation: pulse .5s infinite; }
+  .pill.speaking    { color: var(--red); }    .pill.speaking .dot    { background: var(--red); animation: pulse .7s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .meta { color: var(--dim); font-size: 12.5px; }
+  button, select {
+    background: var(--panel2); color: var(--text); border: 1px solid #2c3344;
+    border-radius: 8px; padding: 7px 14px; font-size: 13.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger:hover { border-color: var(--red); color: var(--red); }
+  button:disabled { opacity: .45; cursor: default; }
+  main { flex: 1; display: flex; gap: 12px; min-height: 0; }
+  #chat {
+    flex: 2.2; background: var(--panel); border-radius: 12px; padding: 16px;
+    overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  }
+  .msg { max-width: 82%; padding: 9px 13px; border-radius: 12px; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel2); border-bottom-left-radius: 4px; }
+  .msg.assistant.interrupted { opacity: .6; }
+  .msg .timing { display: block; margin-top: 5px; font-size: 11px; color: var(--dim); }
+  .msg .cut { color: var(--red); font-size: 11px; font-weight: 600; }
+  #sidebar { flex: 1; display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
+  #meters { background: var(--panel); border-radius: 12px; padding: 12px 16px; }
+  .meter-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 12.5px; color: var(--dim); }
+  .meter-row span { width: 68px; }
+  .bar { flex: 1; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0%; border-radius: 4px; transition: width .06s linear; }
+  #micbar i { background: var(--green); }
+  #outbar i { background: var(--red); }
+  #log {
+    flex: 1; background: var(--panel); border-radius: 12px; padding: 12px 14px;
+    overflow-y: auto; font: 11.5px/1.6 ui-monospace, Menlo, monospace; color: var(--dim);
+  }
+  #log .t { color: #4c5468; margin-right: 6px; }
+  #log .ev-vad { color: var(--accent); } #log .ev-asr { color: var(--amber); }
+  #log .ev-tts { color: var(--red); } #log .ev-int { color: var(--red); font-weight: 700; }
+  #log .ev-llm { color: var(--purple); } #log .ev-sys { color: var(--green); }
+  footer { display: flex; gap: 10px; }
+  #textin {
+    flex: 1; background: var(--panel); border: 1px solid #2c3344; border-radius: 10px;
+    color: var(--text); padding: 10px 14px; font-size: 14.5px; outline: none;
+  }
+  #textin:focus { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Realtime Speech Chat</h1>
+  <span id="status" class="pill"><span class="dot"></span><span id="statusText">disconnected</span></span>
+  <button id="startBtn" class="primary">▶ Start</button>
+  <button id="interruptBtn" class="danger" disabled>✋ Interrupt</button>
+  <select id="voiceSel" disabled></select>
+  <span class="meta" id="modelInfo"></span>
+</header>
+<main>
+  <div id="chat"></div>
+  <div id="sidebar">
+    <div id="meters">
+      <div class="meter-row"><span>mic</span><div class="bar" id="micbar"><i></i></div></div>
+      <div class="meter-row"><span>assistant</span><div class="bar" id="outbar"><i></i></div></div>
+    </div>
+    <div id="log"></div>
+  </div>
+</main>
+<footer>
+  <input id="textin" placeholder="or type a message…" disabled>
+  <button id="sendBtn" disabled>Send</button>
+</footer>
+
+<script>
+const MIC_SR = 16000, TTS_SR = 24000;
+let ws = null, micCtx = null, playCtx = null, micStream = null;
+let running = false, playhead = 0, sources = [];
+let userSpeaking = false, transcribing = false, thinking = false;
+let interruptedUtts = new Set(), curAssistantEl = null, curUtt = null;
+let micLevel = 0;
+
+const $ = id => document.getElementById(id);
+
+function log(cls, text) {
+  const el = $("log");
+  const line = document.createElement("div");
+  const t = new Date().toTimeString().slice(0, 8) + "." + String(Date.now() % 1000).padStart(3, "0");
+  line.innerHTML = `<span class="t">${t}</span><span class="ev-${cls}">${text}</span>`;
+  el.appendChild(line);
+  while (el.childElementCount > 300) el.firstChild.remove();
+  el.scrollTop = el.scrollHeight;
+}
+
+function addMsg(role, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.textContent = text;
+  $("chat").appendChild(el);
+  $("chat").scrollTop = $("chat").scrollHeight;
+  return el;
+}
+
+// ---- audio helpers ----
+function b64FromFloat32(f32) {
+  const u8 = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000)
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function f32FromB64(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Float32Array(u8.buffer);
+}
+function resample(f32, from, to) {
+  if (from === to) return f32;
+  const n = Math.round(f32.length * to / from);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i * (f32.length - 1) / (n - 1);
+    const l = Math.floor(x), r = Math.min(l + 1, f32.length - 1);
+    out[i] = f32[l] + (f32[r] - f32[l]) * (x - l);
+  }
+  return out;
+}
+
+// ---- playback (gapless scheduling) ----
+function enqueueAudio(f32) {
+  const buf = playCtx.createBuffer(1, f32.length, TTS_SR);
+  buf.copyToChannel(f32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  const t = Math.max(playCtx.currentTime + 0.06, playhead);
+  src.start(t);
+  playhead = t + buf.duration;
+  sources.push(src);
+  if (sources.length > 64) sources = sources.filter(() => true).slice(-64);
+}
+function stopPlayback() {
+  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources = [];
+  playhead = 0;
+}
+const isSpeaking = () => playCtx && playhead > playCtx.currentTime + 0.02;
+
+// ---- mic ----
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+  });
+  micCtx = new AudioContext({ sampleRate: MIC_SR });
+  const workletCode = `
+    class MicProcessor extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch) this.port.postMessage(ch.slice(0));
+        return true;
+      }
+    }
+    registerProcessor("mic-processor", MicProcessor);`;
+  await micCtx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" })));
+  const srcNode = micCtx.createMediaStreamSource(micStream);
+  const worklet = new AudioWorkletNode(micCtx, "mic-processor");
+  srcNode.connect(worklet);
+
+  let acc = [];
+  let accLen = 0;
+  const target = Math.round(micCtx.sampleRate * 0.128);
+  worklet.port.onmessage = e => {
+    const frame = e.data;
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    micLevel = Math.max(micLevel * 0.9, Math.sqrt(sum / frame.length));
+    acc.push(frame);
+    accLen += frame.length;
+    if (accLen >= target && ws && ws.readyState === 1) {
+      const joined = new Float32Array(accLen);
+      let off = 0;
+      for (const f of acc) { joined.set(f, off); off += f.length; }
+      acc = []; accLen = 0;
+      const pcm = resample(joined, micCtx.sampleRate, MIC_SR);
+      ws.send(JSON.stringify({ type: "audio", data: b64FromFloat32(pcm) }));
+    }
+  };
+  log("sys", `mic live (ctx ${micCtx.sampleRate} Hz, echo cancellation on)`);
+}
+
+// ---- websocket ----
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => log("sys", "websocket connected");
+  ws.onclose = () => { log("sys", "websocket closed"); setStatus(); };
+  ws.onerror = () => log("int", "websocket error");
+  ws.onmessage = e => handleMessage(JSON.parse(e.data));
+}
+
+function handleMessage(m) {
+  switch (m.type) {
+    case "ready":
+      $("modelInfo").textContent = m.llm_model;
+      const sel = $("voiceSel");
+      sel.innerHTML = m.voices.map(v => `<option ${v === "af_heart" ? "selected" : ""}>${v}</option>`).join("");
+      sel.disabled = false;
+      log("sys", `ready · llm=${m.llm_model}`);
+      break;
+    case "vad":
+      if (m.data === "speech_start") {
+        userSpeaking = true;
+        log("vad", "▶ speech detected");
+        if (isSpeaking()) { stopPlayback(); log("int", "barge-in: playback stopped"); }
+      } else {
+        userSpeaking = false;
+        transcribing = true;
+        log("vad", "■ speech ended → transcribing");
+      }
+      break;
+    case "transcription":
+      transcribing = false;
+      thinking = true;
+      addMsg("user", m.data);
+      log("asr", `"${m.data}"`);
+      break;
+    case "chat_chunk":
+      if (interruptedUtts.has(m.utt)) break;
+      thinking = false;
+      if (curUtt !== m.utt || !curAssistantEl) {
+        curAssistantEl = addMsg("assistant", "");
+        curUtt = m.utt;
+      }
+      curAssistantEl.textContent += (curAssistantEl.textContent ? " " : "") + m.data;
+      $("chat").scrollTop = $("chat").scrollHeight;
+      log("llm", `sentence → tts: "${m.data.slice(0, 60)}${m.data.length > 60 ? "…" : ""}"`);
+      break;
+    case "audio_chunk":
+      if (interruptedUtts.has(m.utt)) break;
+      if (m.pcm) {
+        const f32 = f32FromB64(m.pcm);
+        enqueueAudio(f32);
+        log("tts", `audio chunk ${m.seq} (${(f32.length / TTS_SR).toFixed(2)}s)`);
+      } else if (m.final) {
+        log("tts", "response audio complete");
+      }
+      break;
+    case "chat_done":
+      thinking = false;
+      if (curAssistantEl && !interruptedUtts.has(m.utt)) {
+        const t = document.createElement("span");
+        t.className = "timing";
+        t.textContent = `first token ${m.t_first_token_ms}ms · first audio ${m.t_first_audio_ms}ms`;
+        curAssistantEl.appendChild(t);
+      }
+      curAssistantEl = null; curUtt = null;
+      log("llm", `done · first token ${m.t_first_token_ms}ms · first audio ${m.t_first_audio_ms}ms`);
+      break;
+    case "interrupted":
+      interruptedUtts.add(m.utt);
+      thinking = false;
+      stopPlayback();
+      if (curAssistantEl) {
+        curAssistantEl.classList.add("interrupted");
+        const c = document.createElement("span");
+        c.className = "cut";
+        c.textContent = " ⏹ interrupted";
+        curAssistantEl.appendChild(c);
+        curAssistantEl = null; curUtt = null;
+      }
+      log("int", "⏹ interrupted");
+      break;
+    case "voice_changed":
+      log("sys", `voice → ${m.data}`);
+      break;
+    case "error":
+      log("int", `server error: ${m.data}`);
+      break;
+  }
+}
+
+// ---- status pill + meters ----
+function setStatus() {
+  const pill = $("status"), txt = $("statusText");
+  pill.className = "pill";
+  if (!running || !ws || ws.readyState !== 1) { txt.textContent = "disconnected"; return; }
+  if (isSpeaking())        { pill.classList.add("speaking");     txt.textContent = "assistant speaking"; }
+  else if (thinking)       { pill.classList.add("thinking");     txt.textContent = "thinking…"; }
+  else if (transcribing)   { pill.classList.add("transcribing"); txt.textContent = "transcribing…"; }
+  else if (userSpeaking)   { pill.classList.add("hearing");      txt.textContent = "hearing you"; }
+  else                     { pill.classList.add("listening");    txt.textContent = "listening"; }
+}
+setInterval(() => {
+  setStatus();
+  $("micbar").firstElementChild.style.width = Math.min(100, micLevel * 300) + "%";
+  $("outbar").firstElementChild.style.width = isSpeaking() ? "100%" : "0%";
+  micLevel *= 0.85;
+}, 80);
+
+// ---- controls ----
+$("startBtn").onclick = async () => {
+  if (running) {
+    running = false;
+    if (ws) ws.close();
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (micCtx) micCtx.close();
+    if (playCtx) playCtx.close();
+    micCtx = playCtx = null;
+    stopPlayback();
+    $("startBtn").textContent = "▶ Start";
+    $("startBtn").classList.add("primary");
+    ["interruptBtn", "textin", "sendBtn", "voiceSel"].forEach(id => $(id).disabled = true);
+    return;
+  }
+  try {
+    playCtx = new AudioContext({ sampleRate: TTS_SR });
+    connect();
+    await startMic();
+    running = true;
+    $("startBtn").textContent = "■ Stop";
+    $("startBtn").classList.remove("primary");
+    ["interruptBtn", "textin", "sendBtn"].forEach(id => $(id).disabled = false);
+  } catch (err) {
+    log("int", "start failed: " + err.message);
+  }
+};
+$("interruptBtn").onclick = () => {
+  stopPlayback();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "interrupt" }));
+};
+$("voiceSel").onchange = e => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "set_voice", data: e.target.value }));
+};
+function sendText() {
+  const v = $("textin").value.trim();
+  if (!v || !ws || ws.readyState !== 1) return;
+  $("textin").value = "";
+  addMsg("user", v);
+  thinking = true;
+  ws.send(JSON.stringify({ type: "text", data: v }));
+}
+$("sendBtn").onclick = sendText;
+$("textin").onkeydown = e => { if (e.key === "Enter") sendText(); };
+log("sys", "press Start to connect and enable the mic");
+</script>
+</body>
+</html>

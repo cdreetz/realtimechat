@@ -1,0 +1,4 @@
+# Client deps (local machine, no GPU needed)
+numpy
+sounddevice
+websockets

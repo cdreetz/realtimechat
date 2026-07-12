@@ -1,0 +1,11 @@
+# Server deps (GPU box). Install torch AND torchaudio from the matching CUDA
+# index first, or the PyPI torchaudio (different CUDA ABI) will break imports:
+#   uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+fastapi
+uvicorn[standard]
+numpy
+openai
+transformers
+silero-vad
+kokoro>=0.9
+soundfile

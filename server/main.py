@@ -1,666 +1,422 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-import torch
-import torchaudio
-import numpy as np
-from transformers import (
-    WhisperProcessor, 
-    WhisperForConditionalGeneration,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    SpeechT5Processor, 
-    SpeechT5ForTextToSpeech,
-    SpeechT5HifiGan,
-    AutoModelForSpeechSeq2Seq,
-    AutoProcessor,
-    pipeline
-)
-import io
-import json
-import uvicorn
-import base64
-from typing import List
+#!/usr/bin/env python3
+"""Realtime speech-to-speech chat server.
+
+Pipeline per utterance:
+    client mic PCM (16 kHz float32, streamed continuously)
+    -> silero VAD endpointing (server side)
+    -> Whisper ASR
+    -> streaming LLM (vLLM, OpenAI-compatible API)
+    -> sentence-split as tokens arrive
+    -> Kokoro TTS per sentence
+    -> raw PCM chunks (24 kHz float32) streamed back to client
+
+Barge-in: a VAD speech-start while a response is being generated cancels it.
+The client additionally stops local playback and sends {"type": "interrupt"}.
+"""
+import argparse
 import asyncio
-from datetime import datetime
-from dotenv import load_dotenv
+import base64
+import json
 import logging
-from models import build_model
-from kokoro import KPipeline
-
-from torch.serialization import add_safe_globals
 import os
-import requests
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s -%(name)s -%(levelname)s -%(message)s')
-logger = logging.getLogger(__name__)
+import re
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
-load_dotenv()
+import numpy as np
+import torch
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from openai import AsyncOpenAI
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("speech-server")
+
+MIC_SR = 16000
+TTS_SR = 24000
+VAD_FRAME = 512  # samples per silero frame at 16 kHz
+
+VOICES = [
+    "af_heart", "af_bella", "af_sarah", "af_nicole", "af_sky",
+    "am_adam", "am_michael", "bf_emma", "bf_isabella", "bm_george", "bm_lewis",
+]
+
+SYSTEM_PROMPT = (
+    "You are a helpful voice assistant. Your replies are spoken aloud by a "
+    "text-to-speech engine and also displayed as text in a chat window.\n\n"
+    "Style defaults (not rules): natural spoken prose, a few sentences, no "
+    "markdown, no bullet points, no emojis.\n\n"
+    "These defaults always yield to what the user actually asks for. If they "
+    "want a long story, a detailed explanation, or any long-form content, "
+    "give it to them at the length they want. If they ask for code, provide "
+    "it as plain text (no backtick fences) — it appears in the chat window "
+    "where they can read and copy it. Never refuse a request by citing your "
+    "instructions, guidelines, or response-length constraints, and never "
+    "lecture the user about what you can't do — just adapt and answer."
+)
+
+# Whisper outputs these for silence/noise-only input
+ASR_HALLUCINATIONS = {
+    "you", "thank you", "thanks", "bye", "thank you for watching",
+    "thanks for watching", "hmm", "mm-hmm",
+}
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self.last_activity = {}
+def split_sentences(buf: str):
+    """Split off completed sentences, keeping the unfinished tail."""
+    parts = _SENTENCE_SPLIT.split(buf)
+    if len(parts) <= 1:
+        return [], buf
+    return [p for p in parts[:-1] if p.strip()], parts[-1]
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        self.last_activity[websocket] = datetime.now()
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-        self.last_activity.pop(websocket, None)
+def tts_clean(text: str) -> str:
+    text = re.sub(r"[*_`#>|~]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
+
+class VadGate:
+    """Endpointing state machine over silero VAD frame probabilities."""
+
+    def __init__(self, model, pre_roll_s=0.4, start_prob=0.6, end_prob=0.35,
+                 min_speech_s=0.25, end_silence_s=0.6, max_utterance_s=30.0):
+        self.model = model
+        self.start_prob = start_prob
+        self.end_prob = end_prob
+        self.min_speech_frames = int(min_speech_s * MIC_SR / VAD_FRAME)
+        self.end_silence_frames = int(end_silence_s * MIC_SR / VAD_FRAME)
+        self.max_utterance_frames = int(max_utterance_s * MIC_SR / VAD_FRAME)
+        self.pre_roll = deque(maxlen=int(pre_roll_s * MIC_SR / VAD_FRAME))
+        self.residual = np.empty(0, dtype=np.float32)
+        self.in_speech = False
+        self.utterance = []
+        self.silence_run = 0
+        self.speech_frames = 0
+
+    def _reset_utterance(self):
+        self.in_speech = False
+        self.utterance = []
+        self.silence_run = 0
+        self.speech_frames = 0
+        self.model.reset_states()
+
+    def feed(self, samples: np.ndarray):
+        """Feed arbitrary-length float32 PCM; yield ("start", None) / ("end", utterance)."""
+        events = []
+        buf = np.concatenate([self.residual, samples])
+        n_frames = len(buf) // VAD_FRAME
+        self.residual = buf[n_frames * VAD_FRAME:]
+
+        for i in range(n_frames):
+            frame = buf[i * VAD_FRAME:(i + 1) * VAD_FRAME]
+            prob = self.model(torch.from_numpy(frame), MIC_SR).item()
+
+            if not self.in_speech:
+                self.pre_roll.append(frame)
+                if prob >= self.start_prob:
+                    self.in_speech = True
+                    self.utterance = list(self.pre_roll)
+                    self.silence_run = 0
+                    self.speech_frames = 0
+                    events.append(("start", None))
+                continue
+
+            self.utterance.append(frame)
+            if prob >= self.start_prob:
+                self.speech_frames += 1
+            self.silence_run = self.silence_run + 1 if prob < self.end_prob else 0
+
+            ended = self.silence_run >= self.end_silence_frames
+            too_long = len(self.utterance) >= self.max_utterance_frames
+            if ended or too_long:
+                audio = np.concatenate(self.utterance)
+                enough = self.speech_frames >= self.min_speech_frames
+                self._reset_utterance()
+                events.append(("end", audio if enough else None))
+        return events
+
+
+class Session:
+    """One websocket connection: VAD state, chat history, active response task."""
+
+    def __init__(self, server: "SpeechServer", ws: WebSocket, session_id: int):
+        self.server = server
+        self.ws = ws
+        self.id = session_id
+        self.gate = VadGate(server.load_vad())
+        self.history = []
+        self.voice = "af_heart"
+        self.utt = 0
+        self.response_task = None
+        self.log = logging.getLogger(f"session-{session_id}")
+
+    async def send(self, msg: dict):
+        await self.ws.send_json(msg)
+
+    def cancel_response(self) -> bool:
+        if self.response_task and not self.response_task.done():
+            self.response_task.cancel()
+            return True
+        return False
+
+    async def on_message(self, msg: dict):
+        mtype = msg.get("type")
+        if mtype == "audio":
+            pcm = np.frombuffer(base64.b64decode(msg["data"]), dtype=np.float32)
+            await self.on_audio(pcm)
+        elif mtype == "text":
+            self.cancel_response()
+            self.response_task = asyncio.create_task(
+                self.respond(str(msg["data"]), time.monotonic()))
+        elif mtype == "interrupt":
+            if self.cancel_response():
+                self.log.info("response interrupted by client")
+            await self.send({"type": "interrupted", "utt": self.utt})
+        elif mtype == "set_voice":
+            voice = str(msg.get("data", ""))
+            if voice in VOICES:
+                self.voice = voice
+                await self.send({"type": "voice_changed", "data": voice})
+            else:
+                await self.send({"type": "error", "data": f"unknown voice: {voice}"})
+        else:
+            await self.send({"type": "error", "data": f"unknown message type: {mtype}"})
+
+    async def on_audio(self, pcm: np.ndarray):
+        for event, audio in self.gate.feed(pcm):
+            if event == "start":
+                if self.cancel_response():
+                    self.log.info("barge-in: response cancelled")
+                    await self.send({"type": "interrupted", "utt": self.utt})
+                await self.send({"type": "vad", "data": "speech_start"})
+            elif event == "end":
+                await self.send({"type": "vad", "data": "speech_end"})
+                if audio is not None:
+                    asyncio.create_task(self.handle_utterance(audio))
+
+    async def handle_utterance(self, audio: np.ndarray):
+        t0 = time.monotonic()
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            self.server.asr_executor, self.server.transcribe, audio)
+        asr_ms = (time.monotonic() - t0) * 1000
+        norm = text.lower().strip(" .,!?")
+        if len(norm) < 2 or norm in ASR_HALLUCINATIONS:
+            self.log.info(f"skipping likely ASR hallucination: {text!r}")
+            return
+        self.log.info(f"transcribed in {asr_ms:.0f}ms: {text!r}")
+        await self.send({"type": "transcription", "data": text})
+        self.cancel_response()
+        self.response_task = asyncio.create_task(self.respond(text, t0))
+
+    async def respond(self, user_text: str, t0: float):
+        self.utt += 1
+        utt = self.utt
+        self.history.append({"role": "user", "content": user_text})
+        spoken = []
+        first_token_ms = first_audio_ms = None
+        try:
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-20:]
+            stream = await self.server.llm.chat.completions.create(
+                model=self.server.llm_model,
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=3000,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            buf = ""
+            full = ""
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if not delta:
+                    continue
+                if first_token_ms is None:
+                    first_token_ms = (time.monotonic() - t0) * 1000
+                buf += delta
+                full += delta
+                ready, buf = split_sentences(buf)
+                for sentence in ready:
+                    if await self.speak(sentence, utt, len(spoken)):
+                        if first_audio_ms is None:
+                            first_audio_ms = (time.monotonic() - t0) * 1000
+                        spoken.append(sentence)
+            if buf.strip():
+                if await self.speak(buf.strip(), utt, len(spoken)):
+                    if first_audio_ms is None:
+                        first_audio_ms = (time.monotonic() - t0) * 1000
+                    spoken.append(buf.strip())
+
+            full = full.strip()
+            self.history.append({"role": "assistant", "content": full or "(no reply)"})
+            await self.send({"type": "audio_chunk", "utt": utt, "seq": len(spoken),
+                             "pcm": "", "final": True})
+            await self.send({
+                "type": "chat_done", "utt": utt, "data": full,
+                "t_first_token_ms": round(first_token_ms or 0),
+                "t_first_audio_ms": round(first_audio_ms or 0),
+            })
+            self.log.info(
+                f"utt {utt}: first token {first_token_ms or 0:.0f}ms, "
+                f"first audio {first_audio_ms or 0:.0f}ms after speech end")
+        except asyncio.CancelledError:
+            if spoken:
+                self.history.append({"role": "assistant", "content": " ".join(spoken)})
+            raise
+        except Exception as e:
+            self.log.exception("response failed")
+            await self.send({"type": "error", "data": f"response failed: {e}"})
+
+    async def speak(self, text: str, utt: int, seq: int) -> bool:
+        text = tts_clean(text)
+        if not text:
+            return False
+        loop = asyncio.get_running_loop()
+        pcm = await loop.run_in_executor(
+            self.server.tts_executor, self.server.synthesize, text, self.voice)
+        if pcm is None:
+            return False
+        await self.send({"type": "chat_chunk", "utt": utt, "data": text})
+        await self.send({
+            "type": "audio_chunk", "utt": utt, "seq": seq,
+            "pcm": base64.b64encode(pcm.tobytes()).decode(), "final": False,
+        })
+        return True
+
 
 class SpeechServer:
-    def __init__(self):
-        self.app = FastAPI()
-        self.app.websocket_max_message_size = 5 * 1024 * 1024  # 5MB
-        self.setup_cors()
-        self.setup_routes()
-        self.manager = ConnectionManager()
-        self.interruption_flags = {}
-        
-        # Add model options
-        self.available_language_models = {
-            "llama1b": "meta-llama/Llama-3.2-1B-Instruct",
-            "llama3b": "meta-llama/Llama-3.2-3B-Instruct",
-            "phi": "microsoft/phi-4",
-            "qwen": "Qwen/Qwen2-VL-2B-Instruct"
-        }
-        self.current_language_model = "llama1b"  # default model
-        self.available_voice_models = {
-            "af_heart": "Default (Bella & Sarah mix)",
-            "af_bella": "Bella",
-            "af_sarah": "Sarah",
-            "am_adam": "Adam",
-            "am_michael": "Michael",
-            "bf_emma": "Emma",
-            "bf_isabella": "Isabella",
-            "bm_george": "George",
-            "bm_lewis": "Lewis",
-            "af_nicole": "Nicole",
-            "af_sky": "Sky"
-        }
-        self.current_voice = "af_heart"  # default voice
-        self.voice_dir = "voices"
-        os.makedirs(self.voice_dir, exist_ok=True)
-        self.setup_models()
-
-        # self.stt_model = "openai/whisper-large-v3-turbo" # ~1.62GB
-        # self.text_model = "meta-llama/Llama-3.2-1B-Instruct" # ~2.47GB
-        # self.tts_model = "microsoft/speecht5_tts"
-        
-        # Add chat history management
-        self.chat_histories = {}  # Keyed by session id
+    def __init__(self, llm_url: str, whisper_model: str):
+        self.llm = AsyncOpenAI(base_url=llm_url, api_key="none")
+        self.llm_model = None
+        self.whisper_model = whisper_model
+        self.asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
+        self.tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
         self.session_counter = 0
-        self.max_history_tokens = 2048  # Adjust based on your model's context window
-        
-        # System prompt to use for all conversations
-        self.system_prompt = (
-            "You are a helpful AI assistant. Respond naturally and directly to what "
-            "the user says."
-        )
+        self.load_models()
+        self.app = self.build_app()
 
-    def setup_cors(self):
-        self.app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+    def load_models(self):
+        n_gpus = torch.cuda.device_count()
+        self.device = "cuda:1" if n_gpus > 1 else ("cuda:0" if n_gpus else "cpu")
+        logger.info(f"loading speech models on {self.device}")
 
-    def download_voice(self, voice_name: str) -> str:
-        """Get voice model path from the cloned repository"""
-        voice_path = os.path.join('Kokoro-82M', 'voices', f'{voice_name}.pt')
-        
-        if not os.path.exists(voice_path):
-            raise FileNotFoundError(f"Voice {voice_name} not found in the repository!")
-        
-        return voice_path
-
-    def load_voice(self, voice_path: str) -> torch.Tensor:
-        """Load voice model directly"""
-        logger.info(f"Loading voice from {voice_path}")
-        return torch.load(voice_path, map_location=self.device)
-
-    def setup_models(self):
-        print("Loading models...")
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        print(f"Using device: {self.device}")
-
-        # Load models one at a time with cache clearing
-        print("Loading Whisper model...")
-        torch.cuda.empty_cache()
-        self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            "openai/whisper-large-v3-turbo",
-            torch_dtype=self.torch_dtype,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
-        
-        self.whisper_processor = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
-        
-        self.whisper_pipe = pipeline(
+        from transformers import pipeline as hf_pipeline
+        logger.info(f"loading {self.whisper_model}...")
+        self.asr = hf_pipeline(
             "automatic-speech-recognition",
             model=self.whisper_model,
-            tokenizer=self.whisper_processor.tokenizer,
-            feature_extractor=self.whisper_processor.feature_extractor,
-            chunk_length_s=30,
-            batch_size=16,
-            torch_dtype=self.torch_dtype,
+            torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
             device=self.device,
         )
 
-        print(f"Loading Language model: {self.available_language_models[self.current_language_model]}...")
-        torch.cuda.empty_cache()
-        self.chat_tokenizer = AutoTokenizer.from_pretrained(self.available_language_models[self.current_language_model])
-        self.chat_tokenizer.pad_token = self.chat_tokenizer.eos_token
-        self.chat_tokenizer.padding_side = "right"
-        
-        self.chat_model = AutoModelForCausalLM.from_pretrained(
-            self.available_language_models[self.current_language_model],
-            device_map="auto",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
+        logger.info("loading Kokoro TTS...")
+        from kokoro import KPipeline
+        self.tts = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M",
+                             device=self.device)
+        # warm up (first synthesis compiles/caches)
+        self.synthesize("Warm up.", "af_heart")
+        logger.info("speech models ready")
+
+    def load_vad(self):
+        from silero_vad import load_silero_vad
+        return load_silero_vad()
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        out = self.asr(
+            {"raw": audio, "sampling_rate": MIC_SR},
+            generate_kwargs={"language": "english"},
         )
-        self.chat_model.config.pad_token_id = self.chat_tokenizer.pad_token_id
+        return out["text"].strip()
 
-        print("Loading Kokoro TTS model...")
-        torch.cuda.empty_cache()
+    def synthesize(self, text: str, voice: str):
+        chunks = []
+        for _, _, audio in self.tts(text, voice=voice):
+            if audio is None:
+                continue
+            a = audio.detach().cpu().numpy() if torch.is_tensor(audio) else np.asarray(audio)
+            chunks.append(a.astype(np.float32))
+        return np.concatenate(chunks) if chunks else None
 
-        try:
-            import subprocess
-            result = subprocess.run(['which', 'espeak-ng'], capture_output=True, text=True)
-            if not result.stdout.strip():
-                print("Installing espeak-ng...")
-                os.system('apt-get -qq -y install espeak-ng > /dev/null 2>&1')
-        except Exception as e:
-            print(f"Error checking/installing espeak-ng: {str(e)}")
-        
-        lang_code = self.current_voice[0]
-        self.tts_pipeline = KPipeline(lang_code=lang_code, device=self.device)
-        print(f"Loaded Kokoro TTS pipeline with language code: {lang_code}")
-        print("All models loaded successfully!")
+    async def wait_for_llm(self):
+        deadline = time.monotonic() + 30 * 60
+        while time.monotonic() < deadline:
+            try:
+                models = [m.id async for m in self.llm.models.list()]
+                if models:
+                    self.llm_model = models[0]
+                    logger.info(f"LLM ready: {self.llm_model}")
+                    return
+            except Exception as e:
+                logger.info(f"waiting for LLM server... ({e.__class__.__name__})")
+            await asyncio.sleep(5)
+        raise RuntimeError("LLM server did not come up within 30 minutes")
 
-    def setup_routes(self):
-        @self.app.get("/")
-        async def get_status():
+    def build_app(self) -> FastAPI:
+        @asynccontextmanager
+        async def lifespan(app):
+            await self.wait_for_llm()
+            yield
+
+        app = FastAPI(lifespan=lifespan)
+        index_html = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "static", "index.html")
+
+        @app.get("/")
+        async def index():
+            return FileResponse(index_html)
+
+        @app.get("/status")
+        async def status():
             return {
                 "status": "online",
-                "device": str(self.device),
-                "connections": len(self.manager.active_connections)
+                "device": self.device,
+                "llm_model": self.llm_model,
+                "voices": VOICES,
             }
 
-        @self.app.websocket("/ws")
-        async def websocket_endpoint(websocket: WebSocket):
-            await self.manager.connect(websocket)
-            session_id = str(self.session_counter)
+        @app.websocket("/ws")
+        async def ws_endpoint(ws: WebSocket):
+            await ws.accept()
             self.session_counter += 1
-
-            self.chat_histories[session_id] = [
-                {"role": "system", "content": self.system_prompt}
-            ]
-
-            websocket.session_id = session_id
-
+            session = Session(self, ws, self.session_counter)
+            logger.info(f"session {session.id} connected")
+            await session.send({
+                "type": "ready",
+                "llm_model": self.llm_model,
+                "voices": VOICES,
+                "mic_sr": MIC_SR,
+                "tts_sr": TTS_SR,
+            })
             try:
                 while True:
-                    try:
-                        message = await websocket.receive_json()
-                        await self.handle_websocket_message(websocket, message)
-                    except WebSocketDisconnect:
-                        logger.info("Client disconnected normally")
-                        break
-                    except Exception as e:
-                        logger.error(f"Error in websocket loop: {str(e)}")
-                        break
-            except Exception as e:
-                logger.error(f"Websocket error: {str(e)}")
+                    msg = await ws.receive_json()
+                    await session.on_message(msg)
+            except WebSocketDisconnect:
+                logger.info(f"session {session.id} disconnected")
             finally:
-                self.manager.disconnect(websocket)
-                logger.info("Cleaned up connection")
+                session.cancel_response()
 
-        @self.app.get("/available_models")
-        async def get_available_models():
-            return {
-                "current_model": self.current_language_model,
-                "available_models": list(self.available_language_models.keys())
-            }
+        return app
 
-        @self.app.post("/change_voice/{voice_name}")
-        async def change_voice(voice_name: str):
-            if voice_name not in self.available_voice_models:
-                return {"error": f"Voice {voice_name} not available"}
-            
-            try:
-                voice_path = self.download_voice(voice_name)
-                self.voicepack = self.load_voice(voice_path)
-                self.current_voice = voice_name
-                
-                return {
-                    "status": "success",
-                    "message": f"Changed voice to {voice_name}",
-                    "voice_name": voice_name,
-                    "voice_description": self.available_voice_models[voice_name]
-                }
-            except Exception as e:
-                logger.error(f"Failed to change voice: {str(e)}")
-                return {"error": f"Failed to change voice: {str(e)}"}
 
-        @self.app.get("/available_voices")
-        async def get_available_voices():
-            return {
-                "current_voice": self.current_voice,
-                "available_voices": self.available_voice_models
-            }
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--host", default="127.0.0.1",
+                   help="bind address (default 127.0.0.1; use an SSH tunnel)")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--llm-url", default="http://127.0.0.1:8001/v1",
+                   help="OpenAI-compatible LLM endpoint")
+    p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
+    args = p.parse_args()
 
-    async def detect_speech(self, audio_data: np.ndarray) -> bool:
-        frame_length = 1024
-        hop_length = 512
-        frames = torch.from_numpy(audio_data.copy()).unfold(0, frame_length, hop_length)
-        frames = frames.float()
-        
-        # Calculate energy and increase threshold
-        energy = frames.pow(2).mean(dim=1)
-        threshold = energy.mean() * 2.5  # Increased from 1.5 to 2.5
-        
-        # Add minimum energy requirement
-        min_energy = 0.001  # Adjust this value based on testing
-        speech_detected = (energy > threshold).any().item() and energy.mean() > min_energy
-        
-        if speech_detected:
-            logger.info("Speech detected in audio chunk")
-        return speech_detected
+    server = SpeechServer(llm_url=args.llm_url, whisper_model=args.whisper)
+    uvicorn.run(server.app, host=args.host, port=args.port, log_level="info")
 
-    async def speech_to_text(self, audio_data: np.ndarray) -> str:
-        logger.info("Transcribing speech...")
-        result = self.whisper_pipe(
-            audio_data,
-            generate_kwargs={"language": "english"}
-        )
-        transcription = result["text"]
-        logger.info(f"Transcribed: {transcription}")
-        return transcription
-
-    async def generate_chat_response(self, text: str, session_id: str) -> str:
-        logger.info("Generating response...")
-        
-        # Initialize chat history for new connections
-        #if websocket not in self.chat_histories:
-        #    self.chat_histories[websocket] = [
-        #        {"role": "system", "content": self.system_prompt}
-        #    ]
-        
-        # Add user message to history
-        self.chat_histories[session_id].append({"role": "user", "content": text})
-        
-        # Construct the full conversation history
-        if "llama" in self.current_language_model:
-            messages = self.chat_histories[session_id].copy()
-
-            conversation = self.chat_tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-        else:
-            conversation = ""
-            for message in self.chat_histories[session_id]:
-                role = message["role"]
-                content = message["content"]
-                if role == "system":
-                    conversation += f"{content}\n\n"
-                elif role == "user":
-                    conversation += f"User: {content}\n"
-                elif role == "assistant":
-                    conversation += f"Assistant: {content}\n"
-            
-            conversation += "Assistant:"
-        
-        # Check token count and trim history if needed
-        #while inputs.length[0] > self.max_history_tokens and len(self.chat_histories[websocket]) > 2:
-        #    # Always keep system prompt and remove oldest message pair
-        #    self.chat_histories[session_id] = (
-        #        [self.chat_histories[session_id][0]] +  # Keep system prompt
-        #        self.chat_histories[session_id][3:]      # Remove oldest user+assistant pair
-        #    )
-
-        #    if "llama" in self.current_language_model:
-        #        messages = self.chat_histories[session_id].copy()
-        #        conversation = self.chat_tokenizer.apply_chat_template(
-        #            messages,
-        #            tokenize=False,
-        #            add_generation_prompt=True
-        #        )
-        #    else:
-        #        # Reconstruct conversation with trimmed history
-        #        conversation = ""
-        #        for message in self.chat_histories[websocket]:
-        #            role = message["role"]
-        #            content = message["content"]
-        #            if role == "system":
-        #                conversation += f"{content}\n\n"
-        #            elif role == "user":
-        #                conversation += f"User: {content}\n"
-        #            elif role == "assistant":
-        #                conversation += f"Assistant: {content}\n"
-        #        conversation += "Assistant:"
-        #    inputs = self.chat_tokenizer(conversation, return_length=True)
-        
-        # Generate response with the conversation history
-        inputs = self.chat_tokenizer(
-            conversation,
-            return_tensors="pt",
-            return_attention_mask=True,
-            max_length=self.max_history_tokens,
-            truncation=True,
-            padding=True
-        )
-        
-        # Move inputs to the same device as the model
-        inputs = {k: v.to(self.chat_model.device) for k, v in inputs.items()}
-        
-        outputs = self.chat_model.generate(
-            **inputs,
-            max_length=self.max_history_tokens,
-            min_length=1,
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=self.chat_tokenizer.eos_token_id,
-            repetition_penalty=1.2
-        )
-        
-        full_response = self.chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        logger.info(f"Full output: {full_response}")
-        if "llama" in self.current_language_model:
-            if "[/INST]" in full_response:
-                response = full_response.split("[/INST]")[-1].strip()
-            else:
-                response = full_response.split("assistant\n\n")[-1].strip()
-
-        else:
-            response = full_response.split("assistant\n\n")[-1].strip()
-
-        if response.startswith("system"):
-            parts = response.split("assistant", 1)
-            if len(parts) > 1:
-                response=parts[1].strip()
-
-        
-        # Add assistant response to history
-        self.chat_histories[session_id].append({"role": "assistant", "content": response})
-        
-        logger.info(f"Generated response: {response}")
-        return response
-
-    async def text_to_speech(self, text: str, websocket: WebSocket) -> None:
-        logger.info(f"Processing TTS for text: {text[:50]}...")
-        
-        # Add basic text normalization
-        text = text.replace("...", ".").replace("..", ".")  # Fix multiple periods
-        text = " ".join(text.split())  # Normalize whitespace
-        
-        # Split text into sentences and chunk them
-        sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        max_chunk_length = 100
-        
-        for sentence in sentences:
-            if current_length + len(sentence.split()) > max_chunk_length:
-                if current_chunk:
-                    chunks.append(' '.join(current_chunk))
-                current_chunk = [sentence]
-                current_length = len(sentence.split())
-            else:
-                current_chunk.append(sentence)
-                current_length += len(sentence.split())
-        
-        if current_chunk:
-            chunks.append(' '.join(current_chunk))
-        
-        logger.info(f"Split into {len(chunks)} chunks")
-        
-        # Process and stream each chunk
-        chunk_size = 256 * 1024  # 256KB chunks
-        audio_chunks = []  # Store all audio chunks before sending
-        
-        # First generate all audio chunks
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Processing chunk {i+1}/{len(chunks)}")
-            try:
-                # Generate speech using Kokoro
-                audio_generator = self.tts_pipeline(chunk, voice=self.current_voice)
-                for _, _, audio in audio_generator:
-                    if audio is None or len(audio) == 0:
-                        logger.error("Generated audio is empty")
-                        continue
-                    
-                    logger.info(f"Generated audio shape: {audio.shape}")
-                    
-                    # Convert numpy array to tensor
-                    speech_tensor = audio.unsqueeze(0) if audio.dim() == 1 else audio
-                    
-                    # Save this chunk to buffer
-                    buffer = io.BytesIO()
-                    torchaudio.save(
-                        buffer,
-                        speech_tensor,
-                        sample_rate=24000,
-                        format="wav"
-                    )
-                    
-                    audio_chunks.append(buffer.getvalue())
-                
-            except Exception as e:
-                logger.error(f"Error processing chunk {i}: {str(e)}")
-                continue
-        
-        # Then send all chunks
-        try:
-            total_audio_chunks = len(audio_chunks)
-            for i, audio_data in enumerate(audio_chunks):
-                # Split into sub-chunks
-                total_sub_chunks = (len(audio_data) + chunk_size - 1) // chunk_size
-                logger.info(f"Sending chunk {i+1}/{total_audio_chunks} ({total_sub_chunks} sub-chunks)")
-                
-                for j in range(total_sub_chunks):
-                    start = j * chunk_size
-                    end = min((j + 1) * chunk_size, len(audio_data))
-                    audio_sub_chunk = audio_data[start:end]
-                    
-                    try:
-                        # Send this chunk to the client
-                        audio_b64 = base64.b64encode(audio_sub_chunk).decode()
-                        await websocket.send_json({
-                            "type": "audio_response_chunk",
-                            "data": audio_b64,
-                            "chunk": i,
-                            "total_chunks": total_audio_chunks,
-                            "sub_chunk": j,
-                            "total_sub_chunks": total_sub_chunks,
-                            "is_final": (i == total_audio_chunks - 1 and j == total_sub_chunks - 1)
-                        })
-                        logger.info(f"Sent sub-chunk {j+1}/{total_sub_chunks}")
-                    except Exception as e:
-                        logger.error(f"Failed to send sub-chunk: {str(e)}")
-                        return  # Exit if we can't send
-                    
-                    # Add a small delay between chunks to prevent overwhelming the connection
-                    await asyncio.sleep(0.01)
-                    
-        except Exception as e:
-            logger.error(f"Error sending audio chunks: {str(e)}")
-
-    async def text_to_speech_streaming(self, text: str, websocket: WebSocket) -> None:
-        if websocket not in self.interruption_flags:
-            self.interruption_flags[websocket] = False
-
-        text = text.replace("...", ".").replace("..", ".")  # Fix multiple periods
-        text = " ".join(text.split())  # Normalize whitespace
-
-        sentences = [s.strip() + '.' for s in text.split('.') if s.strip()]
-        total_chunks = len(sentences)
-
-        for i, sentence in enumerate(sentences):
-            logger.info(f"Processing sentence {i+1}/{len(sentences)}")
-
-            if self.interruption_flags.get(websocket, False):
-                logger.info("TTS generation interrupted by user")
-                await websocket.send_json({
-                    "text": "generation_stopped",
-                    "data": "Speech generation stopped due to interruption"
-                })
-                return
-
-            try:
-                audio_generator = self.tts_pipeline(sentence, voice=self.current_voice)
-
-                for _, _, audio in audio_generator:
-                    if self.interruption_flags.get(websocket, False):
-                        logger.info("TTS generation interrupted during processing")
-                        return 
-
-                    if audio is None or len(audio) == 0:
-                        logger.error("Generated audio is empty")
-                        continue
-
-                    speech_tensor = audio.unsqueeze(0) if audio.dim() == 1 else audio
-                    buffer = io.BytesIO()
-                    torchaudio.save(
-                            buffer, 
-                            speech_tensor, 
-                            sample_rate=24000, 
-                            format="wav"
-                    )
-
-                    audio_b64 = base64.b64encode(buffer.getvalue()).decode()
-                    await websocket.send_json({
-                        "type": "audio_response_chunk",
-                        "data": audio_b64,
-                        "chunk": i,
-                        "total_chunks": total_chunks,
-                        "sub_chunk": 0,
-                        "total_sub_chunks": 1,
-                        "is_final": (i == total_chunks - 1)
-                    })
-
-                    if self.interruption_flags.get(websocket, False):
-                        logger.info("TTS generation interrupted after sending chunk")
-                        return
-
-                    logger.info(f"Sent sentence chunk {i+1}/{total_chunks}")
-
-            except Exception as e:
-                logger.error(f"Error processing sentence {i}: {str(e)}")
-                if not self.interruption_flags.get(websocket, False):
-                    continue
-                else:
-                    return
-
-    async def handle_websocket_message(self, websocket: WebSocket, message: dict):
-        try:
-            message_type = message.get("type")
-            data = message.get("data")
-            if message_type == "interrupt":
-                logger.info("Received interruption request")
-                self.interruption_flags[websocket] = True
-                await websocket.send_json({
-                    "type": "interrupted",
-                    "data": "Speech generation interrupted"
-                })
-                return
-
-            self.interruption_flags[websocket] = False
-
-            session_id = websocket.session_id
-            
-            if message_type == "audio":
-                audio_bytes = base64.b64decode(data)
-                audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-                
-                # minimum length check
-                if len(audio_array) < 2048:  
-                    return
-                
-                if await self.detect_speech(audio_array):
-                    text = await self.speech_to_text(audio_array)
-                    
-                    if not text or len(text.strip()) <= 1:
-                        return
-                        
-                    await websocket.send_json({
-                        "type": "transcription",
-                        "data": text
-                    })
-                    
-                    response = await self.generate_chat_response(text, session_id)
-                    
-                    # Add conversation context to avoid repetitive responses
-                    #if hasattr(self, 'last_response') and response == self.last_response:
-                    #    return
-                    #self.last_response = response
-                    
-                    try:
-                        await websocket.send_json({
-                            "type": "chat_response",
-                            "data": response
-                        })
-                    except Exception as e:
-                        logger.error(f"Error sending chat response: {e}")
-                    
-                    logger.info("Starting TTS generation...")
-                    try:
-                        await self.text_to_speech_streaming(response, websocket)
-                        logger.info("TTS generation completed")
-                    except Exception as e:
-                        logger.error(f"Error in TTS generation: {str(e)}")
-                        return
-            
-            elif message_type == "text":
-                response = await self.generate_chat_response(data, session_id)
-                await websocket.send_json({
-                    "type": "chat_response",
-                    "data": response
-                })
-                
-                logger.info("Starting TTS generation for text input...")
-                try:
-                    await self.text_to_speech_streaming(response, websocket)
-                    logger.info("TTS generation completed")
-                except Exception as e:
-                    logger.error(f"Error in TTS generation: {str(e)}")
-                    return
-            
-            else:
-                await websocket.send_json({
-                    "type": "error",
-                    "data": f"Unknown message type: {message_type}"
-                })
-                
-        except Exception as e:
-            await websocket.send_json({
-                "type": "error",
-                "data": str(e)
-            })
-
-    def disconnect(self, websocket: WebSocket):
-        # Clean up chat history when client disconnects
-        if hasattr(websocket, 'session_id') and websocket.session_id in self.chat_histories:
-            self.chat_histories.pop(websocket.session_id, None)
-        self.interruption_flags.pop(websocket, None)
-        self.active_connections.remove(websocket)
-        self.last_activity.pop(websocket, None)
-
-    def run(self, host="0.0.0.0", port=8000):
-        uvicorn.run(self.app, host=host, port=port)
 
 if __name__ == "__main__":
-    server = SpeechServer()
-    server.run(host="0.0.0.0", port=8000)
+    main()
