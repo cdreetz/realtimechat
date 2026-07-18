@@ -9,3 +9,6 @@ transformers
 silero-vad
 kokoro>=0.9
 soundfile
+ddgs
+httpx
+beautifulsoup4

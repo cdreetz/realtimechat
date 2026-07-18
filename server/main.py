@@ -33,6 +33,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from openai import AsyncOpenAI
 
+from tools import TOOLS, run_tool
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("speech-server")
 
@@ -56,7 +58,14 @@ SYSTEM_PROMPT = (
     "it as plain text (no backtick fences) — it appears in the chat window "
     "where they can read and copy it. Never refuse a request by citing your "
     "instructions, guidelines, or response-length constraints, and never "
-    "lecture the user about what you can't do — just adapt and answer."
+    "lecture the user about what you can't do — just adapt and answer.\n\n"
+    "You have tools: web_search, fetch_url, and get_current_time. Use them "
+    "whenever the answer depends on current or verifiable facts (news, "
+    "weather, prices, dates, recent events) instead of guessing. Before your "
+    "first tool call in a turn, say one very short phrase like 'Let me look "
+    "that up.' so the user hears something while the tool runs. After using "
+    "tools, answer conversationally — summarize, never read URLs or raw "
+    "results aloud."
 )
 
 # Whisper outputs these for silence/noise-only input
@@ -372,47 +381,104 @@ class Session:
             if self.server.wants_no_thinking(self.server.llm_model):
                 kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
+            kwargs["tools"] = TOOLS
+
             # Audio-native models hear the actual utterance instead of the
             # transcript (current turn only; history stays text).
+            work = list(messages)
             if audio is not None and self.server.audio_input:
-                audio_messages = messages[:-1] + [{
+                work[-1] = {
                     "role": "user",
                     "content": [{"type": "input_audio", "input_audio": {
                         "data": audio_to_wav_b64(audio), "format": "wav"}}],
-                }]
-                try:
-                    stream = await self.server.llm.chat.completions.create(
-                        messages=audio_messages, **kwargs)
-                except Exception as e:
-                    self.log.warning(
-                        f"audio input rejected ({e.__class__.__name__}: {e}); "
-                        "falling back to transcript")
-                    stream = await self.server.llm.chat.completions.create(
-                        messages=messages, **kwargs)
-            else:
-                stream = await self.server.llm.chat.completions.create(
-                    messages=messages, **kwargs)
+                }
+
             buf = ""
             full = ""
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if not delta:
-                    continue
-                if first_token_ms is None:
-                    first_token_ms = (time.monotonic() - t0) * 1000
-                buf += delta
-                full += delta
-                ready, buf = split_sentences(buf)
-                for sentence in ready:
-                    if await self.speak(sentence, utt, len(spoken)):
-                        if first_audio_ms is None:
-                            first_audio_ms = (time.monotonic() - t0) * 1000
-                        spoken.append(sentence)
-            if buf.strip():
-                if await self.speak(buf.strip(), utt, len(spoken)):
+
+            async def flush_speak(text):
+                nonlocal first_audio_ms
+                if await self.speak(text, utt, len(spoken)):
                     if first_audio_ms is None:
                         first_audio_ms = (time.monotonic() - t0) * 1000
-                    spoken.append(buf.strip())
+                    spoken.append(text)
+
+            for round_i in range(5):
+                try:
+                    stream = await self.server.llm.chat.completions.create(
+                        messages=work, **kwargs)
+                except Exception as e:
+                    if round_i == 0 and audio is not None and self.server.audio_input:
+                        self.log.warning(
+                            f"audio input rejected ({e.__class__.__name__}); "
+                            "falling back to transcript")
+                        work = list(messages)
+                        stream = await self.server.llm.chat.completions.create(
+                            messages=work, **kwargs)
+                    else:
+                        raise
+
+                tool_calls = {}
+                round_content = ""
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index if tc.index is not None else 0
+                            ent = tool_calls.setdefault(
+                                idx, {"id": None, "name": "", "args": ""})
+                            if tc.id:
+                                ent["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                ent["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                ent["args"] += tc.function.arguments
+                    content = delta.content if delta else None
+                    if not content:
+                        continue
+                    if first_token_ms is None:
+                        first_token_ms = (time.monotonic() - t0) * 1000
+                    buf += content
+                    full += content
+                    ready, buf = split_sentences(buf)
+                    for sentence in ready:
+                        await flush_speak(sentence)
+
+                if not tool_calls:
+                    break
+
+                # Speak any buffered pre-tool phrase ("Let me check…") so the
+                # user hears something while tools run.
+                if buf.strip():
+                    await flush_speak(buf.strip())
+                    buf = ""
+                calls = [tool_calls[i] for i in sorted(tool_calls)]
+                for i, c in enumerate(calls):
+                    c["id"] = c["id"] or f"call_{utt}_{round_i}_{i}"
+                work.append({
+                    "role": "assistant",
+                    "content": round_content or None,
+                    "tool_calls": [{
+                        "id": c["id"], "type": "function",
+                        "function": {"name": c["name"],
+                                     "arguments": c["args"] or "{}"},
+                    } for c in calls],
+                })
+                for c in calls:
+                    self.log.info(f"tool call: {c['name']}({c['args'][:120]})")
+                    await self.send({"type": "tool_call", "utt": utt,
+                                     "name": c["name"], "args": c["args"][:200]})
+                    result = await run_tool(c["name"], c["args"])
+                    await self.send({"type": "tool_result", "utt": utt,
+                                     "name": c["name"],
+                                     "preview": result[:200]})
+                    work.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": result})
+
+            if buf.strip():
+                await flush_speak(buf.strip())
 
             full = full.strip()
             self.history.append({"role": "assistant", "content": full or "(no reply)"})

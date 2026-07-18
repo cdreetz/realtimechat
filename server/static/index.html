@@ -48,6 +48,10 @@
   .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
   .msg.assistant { align-self: flex-start; background: var(--panel2); border-bottom-left-radius: 4px; }
   .msg.assistant.interrupted { opacity: .6; }
+  .msg.tool {
+    align-self: flex-start; background: none; border: 1px dashed #2c3344;
+    color: var(--dim); font-size: 12px; padding: 5px 11px;
+  }
   .msg .timing { display: block; margin-top: 5px; font-size: 11px; color: var(--dim); }
   .msg .cut { color: var(--red); font-size: 11px; font-weight: 600; }
   #sidebar { flex: 1; display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
@@ -308,6 +312,13 @@ function handleMessage(m) {
         curAssistantEl = null; curUtt = null;
       }
       log("int", "⏹ interrupted");
+      break;
+    case "tool_call":
+      addMsg("tool", `⚙ ${m.name}(${m.args})`);
+      log("llm", `tool call: ${m.name}(${m.args.slice(0, 80)})`);
+      break;
+    case "tool_result":
+      log("llm", `tool result: ${m.name} → ${m.preview.slice(0, 100).replace(/\n/g, " ")}`);
       break;
     case "voice_changed":
       log("sys", `voice → ${m.data}`);
