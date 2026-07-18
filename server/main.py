@@ -16,6 +16,7 @@ The client additionally stops local playback and sends {"type": "interrupt"}.
 import argparse
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -64,6 +65,37 @@ ASR_HALLUCINATIONS = {
     "thanks for watching", "hmm", "mm-hmm",
 }
 
+TURN_CLASSIFIER_PROMPT = (
+    "You judge whether a speaker has finished their conversational turn. "
+    "Given a voice transcript, answer DONE if it is a complete utterance the "
+    "assistant should respond to now, or WAIT if the speaker trailed off "
+    "mid-thought and will likely continue. Answer with exactly one word: "
+    "DONE or WAIT."
+)
+
+# words a turn essentially never ends on -> speaker is mid-thought
+MIDTHOUGHT_ENDINGS = {
+    "and", "but", "or", "so", "because", "if", "when", "while", "then",
+    "um", "uh", "like", "the", "a", "an", "to", "with", "of", "for", "in",
+    "on", "at", "is", "are", "was", "were", "i", "we", "they", "it's",
+    "that", "my", "your", "his", "her", "their", "very", "really",
+}
+
+
+def turn_heuristic(text: str):
+    """Fast local verdict: "done", "wait", or None (ambiguous -> ask the LLM)."""
+    t = text.strip().lower()
+    if not t:
+        return "wait"
+    if t.endswith("?"):
+        return "done"
+    if t.endswith(("...", "…", ",", "-", "–", ":")):
+        return "wait"
+    words = t.rstrip(".!").split()
+    if words and words[-1] in MIDTHOUGHT_ENDINGS:
+        return "wait"
+    return None
+
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 
@@ -80,15 +112,31 @@ def tts_clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def audio_to_wav_b64(audio: np.ndarray) -> str:
+    import soundfile as sf
+    buf = io.BytesIO()
+    sf.write(buf, audio, MIC_SR, format="WAV", subtype="PCM_16")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 class VadGate:
-    """Endpointing state machine over silero VAD frame probabilities."""
+    """Endpointing state machine over silero VAD frame probabilities.
+
+    Emits ("start", None) at speech onset, ("pause", audio_so_far) after a
+    short silence (a candidate end-of-turn for semantic evaluation),
+    ("resume", None) if speech continues after a pause, and ("end", audio)
+    after a long silence or the utterance length cap (audio is None if there
+    was not enough speech to bother with).
+    """
 
     def __init__(self, model, pre_roll_s=0.4, start_prob=0.6, end_prob=0.35,
-                 min_speech_s=0.25, end_silence_s=0.6, max_utterance_s=30.0):
+                 min_speech_s=0.25, pause_silence_s=0.35, end_silence_s=2.4,
+                 max_utterance_s=45.0):
         self.model = model
         self.start_prob = start_prob
         self.end_prob = end_prob
         self.min_speech_frames = int(min_speech_s * MIC_SR / VAD_FRAME)
+        self.pause_frames = int(pause_silence_s * MIC_SR / VAD_FRAME)
         self.end_silence_frames = int(end_silence_s * MIC_SR / VAD_FRAME)
         self.max_utterance_frames = int(max_utterance_s * MIC_SR / VAD_FRAME)
         self.pre_roll = deque(maxlen=int(pre_roll_s * MIC_SR / VAD_FRAME))
@@ -97,16 +145,18 @@ class VadGate:
         self.utterance = []
         self.silence_run = 0
         self.speech_frames = 0
+        self.pause_emitted = False
 
-    def _reset_utterance(self):
+    def force_reset(self):
+        """Drop the current utterance (used when a pause is judged end-of-turn)."""
         self.in_speech = False
         self.utterance = []
         self.silence_run = 0
         self.speech_frames = 0
+        self.pause_emitted = False
         self.model.reset_states()
 
     def feed(self, samples: np.ndarray):
-        """Feed arbitrary-length float32 PCM; yield ("start", None) / ("end", utterance)."""
         events = []
         buf = np.concatenate([self.residual, samples])
         n_frames = len(buf) // VAD_FRAME
@@ -123,20 +173,33 @@ class VadGate:
                     self.utterance = list(self.pre_roll)
                     self.silence_run = 0
                     self.speech_frames = 0
+                    self.pause_emitted = False
                     events.append(("start", None))
                 continue
 
             self.utterance.append(frame)
             if prob >= self.start_prob:
                 self.speech_frames += 1
-            self.silence_run = self.silence_run + 1 if prob < self.end_prob else 0
+            if prob < self.end_prob:
+                self.silence_run += 1
+            else:
+                if self.pause_emitted:
+                    self.pause_emitted = False
+                    events.append(("resume", None))
+                self.silence_run = 0
+
+            if (not self.pause_emitted
+                    and self.silence_run == self.pause_frames
+                    and self.speech_frames >= self.min_speech_frames):
+                self.pause_emitted = True
+                events.append(("pause", np.concatenate(self.utterance)))
 
             ended = self.silence_run >= self.end_silence_frames
             too_long = len(self.utterance) >= self.max_utterance_frames
             if ended or too_long:
                 audio = np.concatenate(self.utterance)
                 enough = self.speech_frames >= self.min_speech_frames
-                self._reset_utterance()
+                self.force_reset()
                 events.append(("end", audio if enough else None))
         return events
 
@@ -153,6 +216,9 @@ class Session:
         self.voice = "af_heart"
         self.utt = 0
         self.response_task = None
+        self.eval_task = None
+        self.gate_gen = 0          # bumped on start/resume; stale evals discard
+        self.pause_transcript = None  # (gen, text) reusable at hard end
         self.log = logging.getLogger(f"session-{session_id}")
 
     async def send(self, msg: dict):
@@ -187,34 +253,107 @@ class Session:
         else:
             await self.send({"type": "error", "data": f"unknown message type: {mtype}"})
 
+    def cancel_eval(self):
+        if self.eval_task and not self.eval_task.done():
+            self.eval_task.cancel()
+
     async def on_audio(self, pcm: np.ndarray):
         for event, audio in self.gate.feed(pcm):
             if event == "start":
+                self.gate_gen += 1
+                self.cancel_eval()
                 if self.cancel_response():
                     self.log.info("barge-in: response cancelled")
                     await self.send({"type": "interrupted", "utt": self.utt})
                 await self.send({"type": "vad", "data": "speech_start"})
+            elif event == "resume":
+                self.gate_gen += 1
+                self.cancel_eval()
+                await self.send({"type": "vad", "data": "resume"})
+            elif event == "pause":
+                await self.send({"type": "vad", "data": "pause"})
+                self.eval_task = asyncio.create_task(
+                    self.evaluate_pause(audio, self.gate_gen))
             elif event == "end":
+                self.cancel_eval()
                 await self.send({"type": "vad", "data": "speech_end"})
                 if audio is not None:
-                    asyncio.create_task(self.handle_utterance(audio))
+                    asyncio.create_task(self.finalize_turn(audio))
 
-    async def handle_utterance(self, audio: np.ndarray):
+    async def evaluate_pause(self, audio: np.ndarray, gen: int):
+        """Short pause: transcribe and judge whether the turn is complete."""
         t0 = time.monotonic()
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(
             self.server.asr_executor, self.server.transcribe, audio)
-        asr_ms = (time.monotonic() - t0) * 1000
+        if gen != self.gate_gen:
+            return  # user resumed while we transcribed
+        norm = text.lower().strip(" .,!?")
+        if len(norm) < 2 or norm in ASR_HALLUCINATIONS:
+            return  # noise; let the hard end handle it
+        verdict = turn_heuristic(text)
+        source = "heuristic"
+        if verdict is None:
+            verdict = await self.classify_turn(text)
+            source = "llm"
+        if gen != self.gate_gen:
+            return
+        ms = (time.monotonic() - t0) * 1000
+        self.log.info(f"endpoint {verdict} ({source}, {ms:.0f}ms): {text!r}")
+        await self.send({"type": "endpoint", "data": verdict,
+                         "source": source, "transcript": text})
+        if verdict == "done":
+            self.gate.force_reset()
+            self.gate_gen += 1
+            await self.start_turn(text, t0, audio)
+        else:
+            self.pause_transcript = (gen, text)
+
+    async def classify_turn(self, text: str) -> str:
+        if not self.server.classifier_model:
+            return "done"
+        try:
+            kwargs = {}
+            if self.server.wants_no_thinking(self.server.classifier_model):
+                kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            r = await self.server.classifier_llm.chat.completions.create(
+                model=self.server.classifier_model,
+                messages=[{"role": "system", "content": TURN_CLASSIFIER_PROMPT},
+                          {"role": "user", "content": text}],
+                max_tokens=3,
+                temperature=0.0,
+                **kwargs,
+            )
+            out = (r.choices[0].message.content or "").lower()
+            return "wait" if "wait" in out else "done"
+        except Exception as e:
+            self.log.warning(f"turn classifier failed ({e}); assuming done")
+            return "done"
+
+    async def finalize_turn(self, audio: np.ndarray):
+        """Hard end (long silence / length cap): respond even if mid-thought."""
+        t0 = time.monotonic()
+        if self.pause_transcript and self.pause_transcript[0] == self.gate_gen:
+            text = self.pause_transcript[1]
+        else:
+            loop = asyncio.get_running_loop()
+            text = await loop.run_in_executor(
+                self.server.asr_executor, self.server.transcribe, audio)
+        self.pause_transcript = None
         norm = text.lower().strip(" .,!?")
         if len(norm) < 2 or norm in ASR_HALLUCINATIONS:
             self.log.info(f"skipping likely ASR hallucination: {text!r}")
             return
-        self.log.info(f"transcribed in {asr_ms:.0f}ms: {text!r}")
+        await self.start_turn(text, t0, audio)
+
+    async def start_turn(self, text: str, t0: float, audio: np.ndarray = None):
+        self.pause_transcript = None
+        self.log.info(f"turn: {text!r}")
         await self.send({"type": "transcription", "data": text})
         self.cancel_response()
-        self.response_task = asyncio.create_task(self.respond(text, t0))
+        self.response_task = asyncio.create_task(self.respond(text, t0, audio))
 
-    async def respond(self, user_text: str, t0: float):
+    async def respond(self, user_text: str, t0: float, audio: np.ndarray = None):
         self.utt += 1
         utt = self.utt
         self.history.append({"role": "user", "content": user_text})
@@ -222,14 +361,37 @@ class Session:
         first_token_ms = first_audio_ms = None
         try:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-20:]
-            stream = await self.server.llm.chat.completions.create(
+            kwargs = dict(
                 model=self.server.llm_model,
-                messages=messages,
                 stream=True,
                 temperature=0.7,
-                max_tokens=3000,
-                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                max_tokens=None if self.server.reasoning_effort else 3000,
             )
+            if self.server.reasoning_effort:
+                kwargs["reasoning_effort"] = self.server.reasoning_effort
+            if self.server.wants_no_thinking(self.server.llm_model):
+                kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+            # Audio-native models hear the actual utterance instead of the
+            # transcript (current turn only; history stays text).
+            if audio is not None and self.server.audio_input:
+                audio_messages = messages[:-1] + [{
+                    "role": "user",
+                    "content": [{"type": "input_audio", "input_audio": {
+                        "data": audio_to_wav_b64(audio), "format": "wav"}}],
+                }]
+                try:
+                    stream = await self.server.llm.chat.completions.create(
+                        messages=audio_messages, **kwargs)
+                except Exception as e:
+                    self.log.warning(
+                        f"audio input rejected ({e.__class__.__name__}: {e}); "
+                        "falling back to transcript")
+                    stream = await self.server.llm.chat.completions.create(
+                        messages=messages, **kwargs)
+            else:
+                stream = await self.server.llm.chat.completions.create(
+                    messages=messages, **kwargs)
             buf = ""
             full = ""
             async for chunk in stream:
@@ -290,9 +452,16 @@ class Session:
 
 
 class SpeechServer:
-    def __init__(self, llm_url: str, whisper_model: str):
-        self.llm = AsyncOpenAI(base_url=llm_url, api_key="none")
-        self.llm_model = None
+    def __init__(self, llm_url: str, whisper_model: str, llm_model: str = None,
+                 llm_api_key: str = None, classifier_url: str = None,
+                 reasoning_effort: str = None, audio_input: bool = False):
+        self.llm = AsyncOpenAI(base_url=llm_url, api_key=llm_api_key or "none")
+        self.llm_model = llm_model
+        self.reasoning_effort = reasoning_effort
+        self.audio_input = audio_input
+        self.classifier_llm = (AsyncOpenAI(base_url=classifier_url, api_key="none")
+                               if classifier_url else self.llm)
+        self.classifier_model = None
         self.whisper_model = whisper_model
         self.asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
         self.tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
@@ -342,19 +511,40 @@ class SpeechServer:
             chunks.append(a.astype(np.float32))
         return np.concatenate(chunks) if chunks else None
 
+    def wants_no_thinking(self, model: str) -> bool:
+        """Local Qwen hybrid-thinking models need enable_thinking=False."""
+        return model is not None and "qwen" in model.lower()
+
     async def wait_for_llm(self):
-        deadline = time.monotonic() + 30 * 60
-        while time.monotonic() < deadline:
+        if self.llm_model is None:
+            deadline = time.monotonic() + 30 * 60
+            while time.monotonic() < deadline:
+                try:
+                    models = [m.id async for m in self.llm.models.list()]
+                    if models:
+                        self.llm_model = models[0]
+                        break
+                except Exception as e:
+                    logger.info(f"waiting for LLM server... ({e.__class__.__name__})")
+                await asyncio.sleep(5)
+            if self.llm_model is None:
+                raise RuntimeError("LLM server did not come up within 30 minutes")
+        logger.info(f"LLM: {self.llm_model} (audio_input={self.audio_input}, "
+                    f"reasoning_effort={self.reasoning_effort})")
+
+        # Turn classifier prefers a fast local model; degrade to heuristics-only.
+        if self.classifier_llm is self.llm:
+            self.classifier_model = self.llm_model
+        else:
             try:
-                models = [m.id async for m in self.llm.models.list()]
-                if models:
-                    self.llm_model = models[0]
-                    logger.info(f"LLM ready: {self.llm_model}")
-                    return
-            except Exception as e:
-                logger.info(f"waiting for LLM server... ({e.__class__.__name__})")
-            await asyncio.sleep(5)
-        raise RuntimeError("LLM server did not come up within 30 minutes")
+                models = [m.id async for m in self.classifier_llm.models.list()]
+                self.classifier_model = models[0] if models else None
+            except Exception:
+                self.classifier_model = None
+        if self.classifier_model:
+            logger.info(f"turn classifier: {self.classifier_model}")
+        else:
+            logger.warning("no turn classifier LLM reachable; heuristics only")
 
     def build_app(self) -> FastAPI:
         @asynccontextmanager
@@ -400,6 +590,7 @@ class SpeechServer:
                 logger.info(f"session {session.id} disconnected")
             finally:
                 session.cancel_response()
+                session.cancel_eval()
 
         return app
 
@@ -411,10 +602,32 @@ def main():
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--llm-url", default="http://127.0.0.1:8001/v1",
                    help="OpenAI-compatible LLM endpoint")
+    p.add_argument("--llm-model", default=None,
+                   help="model id (default: first model the endpoint lists)")
+    p.add_argument("--llm-api-key-env", default=None, metavar="ENV_VAR",
+                   help="name of an env var holding the LLM API key")
+    p.add_argument("--reasoning-effort", default=None,
+                   choices=["low", "medium", "high"],
+                   help="pass reasoning_effort to the LLM (reasoning models only)")
+    p.add_argument("--audio-input", action="store_true",
+                   help="send user turns as audio to an audio-native LLM "
+                        "(falls back to the transcript if rejected)")
+    p.add_argument("--classifier-url", default="http://127.0.0.1:8001/v1",
+                   help="fast local LLM for end-of-turn classification "
+                        "(heuristics-only if unreachable)")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     args = p.parse_args()
 
-    server = SpeechServer(llm_url=args.llm_url, whisper_model=args.whisper)
+    api_key = os.environ.get(args.llm_api_key_env) if args.llm_api_key_env else None
+    if args.llm_api_key_env and not api_key:
+        p.error(f"--llm-api-key-env: ${args.llm_api_key_env} is not set")
+    classifier_url = None if args.classifier_url == args.llm_url else args.classifier_url
+
+    server = SpeechServer(
+        llm_url=args.llm_url, whisper_model=args.whisper,
+        llm_model=args.llm_model, llm_api_key=api_key,
+        classifier_url=classifier_url, reasoning_effort=args.reasoning_effort,
+        audio_input=args.audio_input)
     uvicorn.run(server.app, host=args.host, port=args.port, log_level="info")
 
 

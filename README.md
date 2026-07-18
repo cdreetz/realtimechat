@@ -40,6 +40,28 @@ uv pip install -p .venv -r server/requirements.txt pip
 .venv/bin/python server/main.py            # binds 127.0.0.1:8000
 ```
 
+## Using a different LLM backend
+
+The chat model is any OpenAI-compatible endpoint. For a remote model, e.g.
+Thinking Machines' Inkling on Tinker:
+
+```bash
+export TINKER_API_KEY=...
+.venv/bin/python server/main.py \
+  --llm-url https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1 \
+  --llm-model thinkingmachines/Inkling \
+  --llm-api-key-env TINKER_API_KEY \
+  --reasoning-effort low \
+  --audio-input
+```
+
+`--audio-input` sends each user turn as audio (WAV) for audio-native models,
+so the model hears your actual voice; it falls back to the Whisper transcript
+automatically if the endpoint rejects audio. Whisper still runs either way —
+the UI transcript, chat history, and end-of-turn classification use it. The
+end-of-turn classifier keeps using the fast local vLLM (`--classifier-url`)
+so remote-model latency never delays endpointing.
+
 ## Talking to it
 
 Open an SSH tunnel and point a browser at the server:

@@ -102,7 +102,7 @@
 const MIC_SR = 16000, TTS_SR = 24000;
 let ws = null, micCtx = null, playCtx = null, micStream = null;
 let running = false, playhead = 0, sources = [];
-let userSpeaking = false, transcribing = false, thinking = false;
+let userSpeaking = false, transcribing = false, thinking = false, checkingTurn = false;
 let interruptedUtts = new Set(), curAssistantEl = null, curUtt = null;
 let micLevel = 0;
 
@@ -237,14 +237,25 @@ function handleMessage(m) {
       break;
     case "vad":
       if (m.data === "speech_start") {
-        userSpeaking = true;
+        userSpeaking = true; checkingTurn = false;
         log("vad", "▶ speech detected");
         if (isSpeaking()) { stopPlayback(); log("int", "barge-in: playback stopped"); }
-      } else {
-        userSpeaking = false;
+      } else if (m.data === "pause") {
+        checkingTurn = true;
+        log("vad", "⏸ pause → checking if you're done…");
+      } else if (m.data === "resume") {
+        checkingTurn = false;
+        log("vad", "▶ resumed speaking");
+      } else { // speech_end (hard end after long silence)
+        userSpeaking = false; checkingTurn = false;
         transcribing = true;
         log("vad", "■ speech ended → transcribing");
       }
+      break;
+    case "endpoint":
+      checkingTurn = false;
+      if (m.data === "done") { userSpeaking = false; thinking = true; }
+      log("vad", `endpoint: ${m.data.toUpperCase()} (${m.source}) — "${m.transcript.slice(0, 50)}${m.transcript.length > 50 ? "…" : ""}"`);
       break;
     case "transcription":
       transcribing = false;
@@ -314,6 +325,7 @@ function setStatus() {
   if (!running || !ws || ws.readyState !== 1) { txt.textContent = "disconnected"; return; }
   if (isSpeaking())        { pill.classList.add("speaking");     txt.textContent = "assistant speaking"; }
   else if (thinking)       { pill.classList.add("thinking");     txt.textContent = "thinking…"; }
+  else if (checkingTurn)   { pill.classList.add("transcribing"); txt.textContent = "done talking…?"; }
   else if (transcribing)   { pill.classList.add("transcribing"); txt.textContent = "transcribing…"; }
   else if (userSpeaking)   { pill.classList.add("hearing");      txt.textContent = "hearing you"; }
   else                     { pill.classList.add("listening");    txt.textContent = "listening"; }

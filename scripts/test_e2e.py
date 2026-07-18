@@ -29,6 +29,8 @@ async def collect_response(ws, timeout=90):
         events.append(msg["type"])
         if msg["type"] == "transcription":
             transcription = msg["data"]
+        elif msg["type"] == "endpoint":
+            print(f"  endpoint: {msg['data']} ({msg['source']})")
         elif msg["type"] == "audio_chunk" and msg.get("pcm"):
             audio_samples += len(base64.b64decode(msg["pcm"])) // 4
         elif msg["type"] == "error":
@@ -82,7 +84,7 @@ async def main():
                 "data": base64.b64encode(audio[i:i + chunk].tobytes()).decode()}))
             await asyncio.sleep(0.01)  # faster than realtime but paced
         silence = np.zeros(chunk, dtype=np.float32)
-        for _ in range(12):  # ~1.5 s of silence to trigger endpointing
+        for _ in range(24):  # ~3 s of silence: covers the hard-end path too
             await ws.send(json.dumps({
                 "type": "audio",
                 "data": base64.b64encode(silence.tobytes()).decode()}))
