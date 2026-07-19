@@ -667,11 +667,16 @@ function connect() {
 }
 function handle(m) {
   switch (m.type) {
-    case "ready":
+    case "ready": {
+      const short = (m.llm_model || "?").split("/").pop();
+      const tname = assistantWin.el.querySelector(".tname");
+      tname.textContent = `Assistant.exe — ${short}`;
+      tname.title = m.llm_model;
       feed("sys", `* llm: ${m.llm_model}`);
       ws.send(JSON.stringify({ type: "register_tools",
         tools: toolSchemas(), instructions: INSTRUCTIONS }));
       break;
+    }
     case "tools_registered":
       feed("sys", `* desktop tools registered: ${m.names.join(", ")}`);
       break;
