@@ -103,5 +103,8 @@ transcription, reply, and returned audio, and prints latency numbers.
 - `server/` — the speech server (FastAPI websocket + browser UI in `static/`)
 - `client/` — optional Python CLI client
 - `scripts/` — end-to-end test
+- `demos/` — apps built on the server's client-tools protocol: a client can
+  `register_tools` over the websocket and the model's calls to those tools
+  are forwarded to the client for execution (see `demos/retro-os/`)
 - `old/` — the previous generation of this project (blocking pipeline,
   WebRTC experiment, manual Kokoro setup); kept for reference, not used

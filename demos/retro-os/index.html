@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RetroVoice OS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font: 12px Tahoma, "MS Sans Serif", Geneva, sans-serif;
+    background: #008080;
+    display: flex; flex-direction: column;
+    user-select: none;
+  }
+  #desktop { flex: 1; position: relative; overflow: hidden; }
+
+  /* --- windows --- */
+  .win {
+    position: absolute; display: flex; flex-direction: column;
+    background: #c0c0c0; padding: 3px;
+    border-top: 2px solid #fff; border-left: 2px solid #fff;
+    border-right: 2px solid #404040; border-bottom: 2px solid #404040;
+    box-shadow: 1px 1px 0 #000;
+    min-width: 180px; min-height: 100px;
+  }
+  .titlebar {
+    display: flex; align-items: center; gap: 4px;
+    background: linear-gradient(90deg, #000080, #1084d0);
+    color: #fff; font-weight: bold; padding: 2px 3px; cursor: default;
+  }
+  .titlebar .ticon { font-size: 12px; }
+  .titlebar .tname { flex: 1; overflow: hidden; white-space: nowrap; }
+  .tbtn {
+    width: 16px; height: 14px; font-size: 9px; line-height: 11px;
+    text-align: center; color: #000; background: #c0c0c0; cursor: pointer;
+    border-top: 1px solid #fff; border-left: 1px solid #fff;
+    border-right: 1px solid #404040; border-bottom: 1px solid #404040;
+  }
+  .tbtn:active { border-top: 1px solid #404040; border-left: 1px solid #404040;
+                 border-right: 1px solid #fff; border-bottom: 1px solid #fff; }
+  .menubar { display: flex; gap: 10px; padding: 3px 5px; }
+  .menubar span:hover { background: #000080; color: #fff; }
+  .winbody { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .notepad-text {
+    flex: 1; resize: none; outline: none; border: 0; padding: 4px;
+    font: 13px "Courier New", monospace; background: #fff; color: #000;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+    user-select: text;
+  }
+
+  /* --- assistant window --- */
+  #assistant .winbody { padding: 4px; gap: 4px; }
+  #statusline {
+    background: #fff; padding: 3px 6px; font-weight: bold;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  #feed {
+    flex: 1; overflow-y: auto; background: #fff; padding: 4px 6px;
+    font: 11px "Courier New", monospace; color: #222;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+    user-select: text;
+  }
+  #feed .you { color: #000080; font-weight: bold; }
+  #feed .bot { color: #005500; }
+  #feed .sys { color: #888; }
+  #feed .tool { color: #aa5500; }
+
+  /* --- taskbar --- */
+  #taskbar {
+    height: 30px; background: #c0c0c0; display: flex; align-items: center;
+    gap: 4px; padding: 2px 4px; border-top: 2px solid #fff;
+  }
+  #startbtn, .taskitem {
+    height: 24px; padding: 0 10px; background: #c0c0c0; font-weight: bold;
+    border-top: 2px solid #fff; border-left: 2px solid #fff;
+    border-right: 2px solid #404040; border-bottom: 2px solid #404040;
+    cursor: pointer; display: flex; align-items: center; gap: 5px;
+    font-size: 12px;
+  }
+  #startbtn:active, .taskitem:active {
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  .taskitem { font-weight: normal; max-width: 160px; overflow: hidden;
+              white-space: nowrap; }
+  #clock {
+    margin-left: auto; height: 24px; padding: 0 10px; display: flex;
+    align-items: center; font-size: 12px;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  #micdot { width: 10px; height: 10px; border-radius: 50%;
+            background: #555; margin-right: 6px; }
+  #micdot.live { background: #2bd42b; }
+  #micdot.hot { background: #ff3b30; }
+
+  /* --- boot dialog --- */
+  #boot {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: #008080; z-index: 9999;
+  }
+  #bootwin { position: static; width: 380px; }
+  #bootwin .winbody { padding: 16px; text-align: center; }
+  #bootwin p { margin-bottom: 14px; line-height: 1.5; }
+  #bootstart {
+    padding: 6px 24px; font-weight: bold; cursor: pointer; background: #c0c0c0;
+    border-top: 2px solid #fff; border-left: 2px solid #fff;
+    border-right: 2px solid #404040; border-bottom: 2px solid #404040;
+  }
+</style>
+</head>
+<body>
+<div id="desktop">
+  <div id="boot">
+    <div class="win" id="bootwin">
+      <div class="titlebar"><span class="ticon">🖥️</span>
+        <span class="tname">RetroVoice OS Setup</span></div>
+      <div class="winbody">
+        <p><b>Welcome to RetroVoice OS</b><br>
+           A voice-controlled desktop. Ask the assistant to open a notepad,
+           write notes, move windows around, or minimize them.</p>
+        <button id="bootstart">▶ Start</button>
+        <p id="booterr" style="color:#800; margin-top:10px;"></p>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="taskbar">
+  <div id="startbtn"><span id="micdot"></span>Start</div>
+  <div id="clock">--:--</div>
+</div>
+
+<script>
+const MIC_SR = 16000, TTS_SR = 24000;
+const params = new URLSearchParams(location.search);
+const SERVER = (params.get("server") || "http://localhost:8000")
+  .replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
+
+let ws = null, micCtx = null, playCtx = null, micStream = null;
+let playhead = 0, sources = [], zTop = 10;
+let userSpeaking = false, thinking = false;
+const interruptedUtts = new Set();
+
+const desktop = document.getElementById("desktop");
+const taskbar = document.getElementById("taskbar");
+const clock = document.getElementById("clock");
+setInterval(() => {
+  clock.textContent = new Date().toTimeString().slice(0, 5);
+}, 1000);
+
+// ================= retro window manager =================
+function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
+  const win = document.createElement("div");
+  win.className = "win";
+  Object.assign(win.style, { left: x + "px", top: y + "px",
+                             width: w + "px", height: h + "px", zIndex: ++zTop });
+  const bar = document.createElement("div");
+  bar.className = "titlebar";
+  bar.innerHTML = `<span class="ticon">${icon}</span><span class="tname">${title}</span>`;
+  const minBtn = document.createElement("div");
+  minBtn.className = "tbtn"; minBtn.textContent = "_";
+  bar.appendChild(minBtn);
+  const body = document.createElement("div");
+  body.className = "winbody";
+  win.append(bar, body);
+  desktop.appendChild(win);
+
+  win.addEventListener("mousedown", () => { win.style.zIndex = ++zTop; });
+  bar.addEventListener("mousedown", e => {
+    if (e.target === minBtn) return;
+    const ox = e.clientX - win.offsetLeft, oy = e.clientY - win.offsetTop;
+    const move = ev => {
+      win.style.left = Math.max(0, ev.clientX - ox) + "px";
+      win.style.top = Math.max(0, ev.clientY - oy) + "px";
+    };
+    const up = () => { document.removeEventListener("mousemove", move);
+                       document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+  minBtn.addEventListener("click", () => onMinimize ? onMinimize() : minimize());
+
+  let taskBtn = null;
+  function minimize() {
+    if (win.style.display === "none") return "already minimized";
+    win.style.display = "none";
+    taskBtn = document.createElement("div");
+    taskBtn.className = "taskitem";
+    taskBtn.innerHTML = `<span>${icon}</span>${title}`;
+    taskBtn.addEventListener("click", restore);
+    taskbar.insertBefore(taskBtn, clock);
+    return "minimized";
+  }
+  function restore() {
+    win.style.display = "flex";
+    win.style.zIndex = ++zTop;
+    if (taskBtn) { taskBtn.remove(); taskBtn = null; }
+  }
+  return { el: win, body, minimize, restore,
+           get minimized() { return win.style.display === "none"; } };
+}
+
+// ================= notepads =================
+const notepads = {};
+let nextNotepadId = 1;
+
+function openNotepad() {
+  const id = nextNotepadId++;
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const win = makeWindow({
+    title: `Untitled ${id} - Notepad`, icon: "📝",
+    x: 24 + ((id - 1) % 5) * 32, y: 24 + ((id - 1) % 5) * 28,
+    w: Math.round(W / 2), h: Math.round(H / 2),
+  });
+  const menu = document.createElement("div");
+  menu.className = "menubar";
+  menu.innerHTML = "<span>File</span><span>Edit</span><span>Help</span>";
+  const ta = document.createElement("textarea");
+  ta.className = "notepad-text";
+  ta.spellcheck = false;
+  win.body.append(menu, ta);
+  notepads[id] = { win, ta };
+  return id;
+}
+
+function getNotepad(id) {
+  return notepads[Number(id)] || null;
+}
+
+// ================= client tools =================
+const toolHandlers = {
+  open_notepad() {
+    const id = openNotepad();
+    feed("tool", `→ opened notepad ${id}`);
+    return `Opened notepad with notepad_id ${id}. It is ${Math.round(desktop.clientWidth / 2)}x${Math.round(desktop.clientHeight / 2)} px at the top-left area of the desktop.`;
+  },
+  write_note({ notepad_id, note_to_write }) {
+    const np = getNotepad(notepad_id);
+    if (!np) return `error: no notepad with id ${notepad_id}`;
+    if (np.win.minimized) np.win.restore();
+    np.ta.value += (np.ta.value ? "\n" : "") + String(note_to_write ?? "");
+    np.ta.scrollTop = np.ta.scrollHeight;
+    feed("tool", `→ wrote to notepad ${notepad_id}`);
+    return `Wrote the note into notepad ${notepad_id}.`;
+  },
+  move_notepad({ notepad_id, x, y }) {
+    const np = getNotepad(notepad_id);
+    if (!np) return `error: no notepad with id ${notepad_id}`;
+    if (np.win.minimized) np.win.restore();
+    const maxX = Math.max(0, desktop.clientWidth - np.win.el.offsetWidth);
+    const maxY = Math.max(0, desktop.clientHeight - np.win.el.offsetHeight);
+    const nx = Math.min(Math.max(0, Math.round(Number(x))), maxX);
+    const ny = Math.min(Math.max(0, Math.round(Number(y))), maxY);
+    np.win.el.style.left = nx + "px";
+    np.win.el.style.top = ny + "px";
+    np.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ moved notepad ${notepad_id} to (${nx}, ${ny})`);
+    return `Moved notepad ${notepad_id} so its top-left corner is at (${nx}, ${ny}).`;
+  },
+  min_notepad({ notepad_id }) {
+    const np = getNotepad(notepad_id);
+    if (!np) return `error: no notepad with id ${notepad_id}`;
+    const r = np.win.minimize();
+    feed("tool", `→ minimized notepad ${notepad_id}`);
+    return `Notepad ${notepad_id}: ${r}.`;
+  },
+};
+
+function toolSchemas() {
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  return [
+    { type: "function", function: {
+        name: "open_notepad",
+        description: `Open a new notepad window on the desktop (it opens at quarter desktop size). Returns the new notepad_id.`,
+        parameters: { type: "object", properties: {} } } },
+    { type: "function", function: {
+        name: "write_note",
+        description: "Append a note to an open notepad.",
+        parameters: { type: "object", properties: {
+          notepad_id: { type: "integer", description: "Id returned by open_notepad." },
+          note_to_write: { type: "string", description: "Text to write." } },
+          required: ["notepad_id", "note_to_write"] } } },
+    { type: "function", function: {
+        name: "move_notepad",
+        description: `Move a notepad window's top-left corner to pixel coordinates. The desktop is ${W}x${H} px; (0,0) is the top-left corner, x grows right, y grows down.`,
+        parameters: { type: "object", properties: {
+          notepad_id: { type: "integer" },
+          x: { type: "integer" }, y: { type: "integer" } },
+          required: ["notepad_id", "x", "y"] } } },
+    { type: "function", function: {
+        name: "min_notepad",
+        description: "Minimize a notepad window to the taskbar.",
+        parameters: { type: "object", properties: {
+          notepad_id: { type: "integer" } },
+          required: ["notepad_id"] } } },
+  ];
+}
+
+const INSTRUCTIONS =
+  "You are the voice assistant of RetroVoice OS, a retro desktop the user is " +
+  "looking at. Use the notepad tools to do what the user asks (open notepads, " +
+  "write notes, move or minimize them) and confirm briefly in speech. " +
+  "'The top' means y=0 keeping x, 'top right corner' means the window flush " +
+  "with that corner, etc. Compute coordinates yourself from the desktop size " +
+  "in the tool descriptions and the window size (quarter desktop).";
+
+// ================= assistant window + feed =================
+let assistantWin, feedEl, statusEl;
+function buildAssistantWindow() {
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  assistantWin = makeWindow({
+    title: "Assistant.exe", icon: "🎙️",
+    x: W - Math.round(W / 3) - 16, y: H - Math.round(H / 2.6) - 16,
+    w: Math.round(W / 3), h: Math.round(H / 2.6),
+  });
+  statusEl = document.createElement("div");
+  statusEl.id = "statusline";
+  statusEl.textContent = "connecting…";
+  feedEl = document.createElement("div");
+  feedEl.id = "feed";
+  assistantWin.body.id = "assistant-body";
+  assistantWin.el.id = "assistant";
+  assistantWin.body.append(statusEl, feedEl);
+}
+function feed(cls, text) {
+  const d = document.createElement("div");
+  d.className = cls;
+  d.textContent = text;
+  feedEl.appendChild(d);
+  while (feedEl.childElementCount > 400) feedEl.firstChild.remove();
+  feedEl.scrollTop = feedEl.scrollHeight;
+}
+function setStatus() {
+  if (!statusEl) return;
+  const dot = document.getElementById("micdot");
+  dot.className = "";
+  if (isSpeaking()) { statusEl.textContent = "🔊 assistant speaking"; dot.className = "hot"; }
+  else if (thinking) { statusEl.textContent = "🤔 thinking…"; dot.className = "live"; }
+  else if (userSpeaking) { statusEl.textContent = "👂 hearing you"; dot.className = "hot"; }
+  else { statusEl.textContent = "🎙️ listening"; dot.className = "live"; }
+}
+setInterval(setStatus, 120);
+
+// ================= audio =================
+function b64FromFloat32(f32) {
+  const u8 = new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength);
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000)
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function f32FromB64(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Float32Array(u8.buffer);
+}
+function resample(f32, from, to) {
+  if (from === to) return f32;
+  const n = Math.round(f32.length * to / from);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = i * (f32.length - 1) / (n - 1);
+    const l = Math.floor(x), r = Math.min(l + 1, f32.length - 1);
+    out[i] = f32[l] + (f32[r] - f32[l]) * (x - l);
+  }
+  return out;
+}
+function enqueueAudio(f32) {
+  const buf = playCtx.createBuffer(1, f32.length, TTS_SR);
+  buf.copyToChannel(f32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  const t = Math.max(playCtx.currentTime + 0.06, playhead);
+  src.start(t);
+  playhead = t + buf.duration;
+  sources.push(src);
+  if (sources.length > 64) sources = sources.slice(-64);
+}
+function stopPlayback() {
+  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources = []; playhead = 0;
+}
+const isSpeaking = () => playCtx && playhead > playCtx.currentTime + 0.02;
+
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true,
+             autoGainControl: true, channelCount: 1 } });
+  micCtx = new AudioContext({ sampleRate: MIC_SR });
+  const code = `class M extends AudioWorkletProcessor {
+    process(i) { const c = i[0] && i[0][0]; if (c) this.port.postMessage(c.slice(0)); return true; } }
+    registerProcessor("m", M);`;
+  await micCtx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  const src = micCtx.createMediaStreamSource(micStream);
+  const node = new AudioWorkletNode(micCtx, "m");
+  src.connect(node);
+  let acc = [], accLen = 0;
+  const target = Math.round(micCtx.sampleRate * 0.128);
+  node.port.onmessage = e => {
+    acc.push(e.data); accLen += e.data.length;
+    if (accLen >= target && ws && ws.readyState === 1) {
+      const joined = new Float32Array(accLen);
+      let off = 0;
+      for (const f of acc) { joined.set(f, off); off += f.length; }
+      acc = []; accLen = 0;
+      ws.send(JSON.stringify({ type: "audio",
+        data: b64FromFloat32(resample(joined, micCtx.sampleRate, MIC_SR)) }));
+    }
+  };
+}
+
+// ================= websocket =================
+let botLinePending = false;
+function connect() {
+  ws = new WebSocket(SERVER);
+  ws.onopen = () => feed("sys", "* connected to speech server");
+  ws.onclose = () => { feed("sys", "* connection closed"); statusEl.textContent = "❌ disconnected"; };
+  ws.onerror = () => feed("sys", "* websocket error — is the tunnel/server up?");
+  ws.onmessage = e => handle(JSON.parse(e.data));
+}
+function handle(m) {
+  switch (m.type) {
+    case "ready":
+      feed("sys", `* llm: ${m.llm_model}`);
+      ws.send(JSON.stringify({ type: "register_tools",
+        tools: toolSchemas(), instructions: INSTRUCTIONS }));
+      break;
+    case "tools_registered":
+      feed("sys", `* desktop tools registered: ${m.names.join(", ")}`);
+      break;
+    case "vad":
+      if (m.data === "speech_start") {
+        userSpeaking = true;
+        if (isSpeaking()) stopPlayback();
+      } else if (m.data === "speech_end") userSpeaking = false;
+      break;
+    case "endpoint":
+      if (m.data === "done") { userSpeaking = false; thinking = true; }
+      break;
+    case "transcription":
+      thinking = true; userSpeaking = false;
+      feed("you", `You: ${m.data}`);
+      break;
+    case "chat_chunk":
+      if (interruptedUtts.has(m.utt)) break;
+      thinking = false;
+      feed("bot", `Assistant: ${m.data}`);
+      break;
+    case "audio_chunk":
+      if (!interruptedUtts.has(m.utt) && m.pcm) enqueueAudio(f32FromB64(m.pcm));
+      break;
+    case "chat_done":
+      thinking = false;
+      break;
+    case "tool_call": {
+      thinking = true;
+      feed("tool", `⚙ ${m.name}(${(m.args || "").slice(0, 120)})`);
+      if (m.call_id && toolHandlers[m.name]) {
+        let result;
+        try {
+          const args = m.args ? JSON.parse(m.args) : {};
+          result = String(toolHandlers[m.name](args));
+        } catch (err) {
+          result = `error: ${err.message}`;
+        }
+        ws.send(JSON.stringify({ type: "tool_result",
+                                 call_id: m.call_id, result }));
+      }
+      break;
+    }
+    case "interrupted":
+      interruptedUtts.add(m.utt);
+      stopPlayback();
+      feed("sys", "* interrupted");
+      thinking = false;
+      break;
+    case "error":
+      feed("sys", `* server error: ${m.data}`);
+      thinking = false;
+      break;
+  }
+}
+
+// ================= boot =================
+document.getElementById("bootstart").addEventListener("click", async () => {
+  try {
+    playCtx = new AudioContext({ sampleRate: TTS_SR });
+    await startMic();
+  } catch (err) {
+    document.getElementById("booterr").textContent =
+      "Could not start audio: " + err.message;
+    return;
+  }
+  document.getElementById("boot").remove();
+  buildAssistantWindow();
+  feed("sys", "* RetroVoice OS ready — try: “open a notepad”");
+  connect();
+});
+</script>
+</body>
+</html>

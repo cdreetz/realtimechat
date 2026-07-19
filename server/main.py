@@ -59,14 +59,16 @@ SYSTEM_PROMPT = (
     "where they can read and copy it. Never refuse a request by citing your "
     "instructions, guidelines, or response-length constraints, and never "
     "lecture the user about what you can't do — just adapt and answer.\n\n"
-    "You have tools: web_search, fetch_url, and get_current_time. Use them "
-    "whenever the answer depends on current or verifiable facts (news, "
-    "weather, prices, dates, recent events) instead of guessing. Before your "
-    "first tool call in a turn, say one very short phrase like 'Let me look "
-    "that up.' so the user hears something while the tool runs. After using "
-    "tools, answer conversationally — summarize, never read URLs or raw "
-    "results aloud."
+    "You may have tools available — some built in (like web search), some "
+    "provided by the user's application. Use a tool whenever the answer "
+    "depends on current or verifiable facts, or when the user asks you to "
+    "act on their environment. Before your first tool call in a turn, say "
+    "one very short phrase like 'Let me look that up.' or 'Sure.' so the "
+    "user hears something while it runs. After using tools, answer "
+    "conversationally — summarize, never read URLs or raw results aloud."
 )
+
+CLIENT_TOOL_TIMEOUT_S = 30
 
 # Whisper outputs these for silence/noise-only input
 ASR_HALLUCINATIONS = {
@@ -228,6 +230,10 @@ class Session:
         self.eval_task = None
         self.gate_gen = 0          # bumped on start/resume; stale evals discard
         self.pause_transcript = None  # (gen, text) reusable at hard end
+        self.client_tools = []        # tool schemas registered by the client
+        self.client_tool_names = set()
+        self.client_instructions = None
+        self.pending_tools = {}       # call_id -> Future awaiting client result
         self.log = logging.getLogger(f"session-{session_id}")
 
     async def send(self, msg: dict):
@@ -252,6 +258,21 @@ class Session:
             if self.cancel_response():
                 self.log.info("response interrupted by client")
             await self.send({"type": "interrupted", "utt": self.utt})
+        elif mtype == "register_tools":
+            tools = [t for t in (msg.get("tools") or [])
+                     if t.get("type") == "function"
+                     and t.get("function", {}).get("name")]
+            self.client_tools = tools
+            self.client_tool_names = {t["function"]["name"] for t in tools}
+            instructions = msg.get("instructions")
+            self.client_instructions = str(instructions) if instructions else None
+            self.log.info(f"client registered tools: {sorted(self.client_tool_names)}")
+            await self.send({"type": "tools_registered",
+                             "names": sorted(self.client_tool_names)})
+        elif mtype == "tool_result":
+            fut = self.pending_tools.pop(msg.get("call_id"), None)
+            if fut and not fut.done():
+                fut.set_result(str(msg.get("result", "")))
         elif mtype == "set_voice":
             voice = str(msg.get("data", ""))
             if voice in VOICES:
@@ -261,6 +282,15 @@ class Session:
                 await self.send({"type": "error", "data": f"unknown voice: {voice}"})
         else:
             await self.send({"type": "error", "data": f"unknown message type: {mtype}"})
+
+    def trimmed_history(self, n=30):
+        """Last n messages, never starting mid tool exchange (orphaned tool
+        results break chat templates)."""
+        h = self.history[-n:]
+        while h and (h[0]["role"] == "tool"
+                     or (h[0]["role"] == "assistant" and h[0].get("tool_calls"))):
+            h = h[1:]
+        return h
 
     def cancel_eval(self):
         if self.eval_task and not self.eval_task.done():
@@ -369,7 +399,10 @@ class Session:
         spoken = []
         first_token_ms = first_audio_ms = None
         try:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-20:]
+            system = SYSTEM_PROMPT
+            if self.client_instructions:
+                system += "\n\n" + self.client_instructions
+            messages = [{"role": "system", "content": system}] + self.trimmed_history()
             kwargs = dict(
                 model=self.server.llm_model,
                 stream=True,
@@ -381,7 +414,7 @@ class Session:
             if self.server.wants_no_thinking(self.server.llm_model):
                 kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
-            kwargs["tools"] = TOOLS
+            kwargs["tools"] = TOOLS + self.client_tools
 
             # Audio-native models hear the actual utterance instead of the
             # transcript (current turn only; history stays text).
@@ -457,25 +490,34 @@ class Session:
                 calls = [tool_calls[i] for i in sorted(tool_calls)]
                 for i, c in enumerate(calls):
                     c["id"] = c["id"] or f"call_{utt}_{round_i}_{i}"
-                work.append({
+                assistant_msg = {
                     "role": "assistant",
-                    "content": round_content or None,
+                    "content": round_content or "",
                     "tool_calls": [{
                         "id": c["id"], "type": "function",
                         "function": {"name": c["name"],
                                      "arguments": c["args"] or "{}"},
                     } for c in calls],
-                })
+                }
+                work.append(assistant_msg)
+                # Tool exchanges go into history too, or the model forgets
+                # what it did (and invents ids / claims phantom actions).
+                self.history.append(assistant_msg)
                 for c in calls:
                     self.log.info(f"tool call: {c['name']}({c['args'][:120]})")
-                    await self.send({"type": "tool_call", "utt": utt,
-                                     "name": c["name"], "args": c["args"][:200]})
-                    result = await run_tool(c["name"], c["args"])
+                    if c["name"] in self.client_tool_names:
+                        result = await self.call_client_tool(c, utt)
+                    else:
+                        await self.send({"type": "tool_call", "utt": utt,
+                                         "name": c["name"], "args": c["args"][:200]})
+                        result = await run_tool(c["name"], c["args"])
                     await self.send({"type": "tool_result", "utt": utt,
                                      "name": c["name"],
                                      "preview": result[:200]})
                     work.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": result})
+                    self.history.append({"role": "tool", "tool_call_id": c["id"],
+                                         "content": result[:2000]})
 
             if buf.strip():
                 await flush_speak(buf.strip())
@@ -499,6 +541,20 @@ class Session:
         except Exception as e:
             self.log.exception("response failed")
             await self.send({"type": "error", "data": f"response failed: {e}"})
+
+    async def call_client_tool(self, call: dict, utt: int) -> str:
+        """Forward a tool call to the client and await its result."""
+        fut = asyncio.get_running_loop().create_future()
+        self.pending_tools[call["id"]] = fut
+        try:
+            await self.send({"type": "tool_call", "utt": utt,
+                             "call_id": call["id"], "name": call["name"],
+                             "args": call["args"] or "{}"})
+            return await asyncio.wait_for(fut, timeout=CLIENT_TOOL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return "error: the application did not respond to the tool call"
+        finally:
+            self.pending_tools.pop(call["id"], None)
 
     async def speak(self, text: str, utt: int, seq: int) -> bool:
         text = tts_clean(text)
