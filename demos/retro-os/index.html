@@ -581,7 +581,12 @@ const toolHandlers = {
     const cur = ed.current;
     ed.files = {};
     refreshTree(ed).then(() => { if (cur) openFileInViewer(ed, cur); });
-    return `exit code ${r.exit_code}\n${r.output.slice(0, 4000) || "(no output)"}`;
+    // full output stays in the terminal; condense what the model sees so
+    // installer noise doesn't flood the chat history
+    let out = r.output || "(no output)";
+    if (out.length > 2000)
+      out = out.slice(0, 500) + `\n… (${out.length - 1700} chars omitted; full output shown in the terminal) …\n` + out.slice(-1200);
+    return `exit code ${r.exit_code}\n${out}`;
   },
 };
 
@@ -860,6 +865,9 @@ function handle(m) {
       stopPlayback();
       feed("sys", "* interrupted");
       thinking = false;
+      break;
+    case "history_trimmed":
+      feed("sys", `* note: oldest ${m.dropped} messages dropped from model context`);
       break;
     case "error":
       feed("sys", `* server error: ${m.data}`);

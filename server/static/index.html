@@ -323,6 +323,9 @@ function handleMessage(m) {
     case "voice_changed":
       log("sys", `voice → ${m.data}`);
       break;
+    case "history_trimmed":
+      log("sys", `history trimmed: oldest ${m.dropped} messages dropped from model context`);
+      break;
     case "error":
       log("int", `server error: ${m.data}`);
       break;

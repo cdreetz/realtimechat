@@ -74,7 +74,16 @@ SYSTEM_PROMPT = (
     "act on their environment. Before your first tool call in a turn, say "
     "one very short phrase like 'Let me look that up.' or 'Sure.' so the "
     "user hears something while it runs. After using tools, answer "
-    "conversationally — summarize, never read URLs or raw results aloud."
+    "conversationally — summarize, never read URLs or raw results aloud.\n\n"
+    "Never claim an action happened unless you actually called the tool "
+    "and saw its result in this conversation — saying 'done' or 'fixed' "
+    "without having made the tool call is a serious failure; announce, "
+    "then immediately call the tool in the same turn. Older parts of long "
+    "conversations get dropped, so if you are unsure what you did or what "
+    "state the user's environment is in, check with a tool (list files, "
+    "read the file, query state) instead of guessing or asserting from "
+    "memory. If the user says you are wrong about a past action, check "
+    "before responding."
 )
 
 CLIENT_TOOL_TIMEOUT_S = 30
@@ -292,14 +301,26 @@ class Session:
         else:
             await self.send({"type": "error", "data": f"unknown message type: {mtype}"})
 
-    def trimmed_history(self, n=30):
-        """Last n messages, never starting mid tool exchange (orphaned tool
-        results break chat templates)."""
-        h = self.history[-n:]
+    def trimmed_history(self):
+        """Full history until it nears the context budget; then drop oldest
+        messages (never starting mid tool exchange — orphaned tool results
+        break chat templates). Returns (messages, dropped_count) so trimming
+        is surfaced, not silent."""
+        def cost(m):  # rough tokens: chars/4 plus per-message overhead
+            return (len(str(m.get("content") or ""))
+                    + len(str(m.get("tool_calls") or ""))) // 4 + 8
+
+        h = list(self.history)
+        total = sum(map(cost, h))
+        dropped = 0
+        while len(h) > 2 and total > self.server.history_budget:
+            total -= cost(h.pop(0))
+            dropped += 1
         while h and (h[0]["role"] == "tool"
                      or (h[0]["role"] == "assistant" and h[0].get("tool_calls"))):
-            h = h[1:]
-        return h
+            total -= cost(h.pop(0))
+            dropped += 1
+        return h, dropped
 
     def cancel_eval(self):
         if self.eval_task and not self.eval_task.done():
@@ -411,7 +432,15 @@ class Session:
             system = SYSTEM_PROMPT
             if self.client_instructions:
                 system += "\n\n" + self.client_instructions
-            messages = [{"role": "system", "content": system}] + self.trimmed_history()
+            hist, dropped = self.trimmed_history()
+            if dropped:
+                system += (f"\n\nNote: this conversation is long — the earliest "
+                           f"{dropped} messages are no longer visible to you. "
+                           f"Anything you don't see, verify with tools.")
+                self.log.warning(f"history trimmed: dropped {dropped} of "
+                                 f"{len(self.history)} messages")
+                await self.send({"type": "history_trimmed", "dropped": dropped})
+            messages = [{"role": "system", "content": system}] + hist
             kwargs = dict(
                 model=self.server.llm_model,
                 stream=True,
@@ -593,6 +622,7 @@ class SpeechServer:
         self.classifier_llm = (AsyncOpenAI(base_url=classifier_url, api_key="none")
                                if classifier_url else self.llm)
         self.classifier_model = None
+        self.history_budget = 80000
         self.whisper_model = whisper_model
         self.asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
         self.tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
@@ -747,6 +777,10 @@ def main():
                    help="fast local LLM for end-of-turn classification "
                         "(heuristics-only if unreachable)")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
+    p.add_argument("--history-budget", type=int, default=80000,
+                   help="approx token budget for chat history before oldest "
+                        "messages are dropped (drop is announced to the model "
+                        "and the client). Use ~5000 for an 8k-context LLM.")
     args = p.parse_args()
 
     api_key = os.environ.get(args.llm_api_key_env) if args.llm_api_key_env else None
@@ -759,6 +793,7 @@ def main():
         llm_model=args.llm_model, llm_api_key=api_key,
         classifier_url=classifier_url, reasoning_effort=args.reasoning_effort,
         audio_input=args.audio_input)
+    server.history_budget = args.history_budget
     uvicorn.run(server.app, host=args.host, port=args.port, log_level="info")
 
 
