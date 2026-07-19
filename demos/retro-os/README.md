@@ -7,7 +7,7 @@ files, edit them, and run bash, with the editor and terminal visible on the
 desktop. All of it happens via client-side tools this page registers with
 the speech server over the websocket (`open_notepad`, `write_note`,
 `move_notepad`, `min_notepad`, `close_notepad`, `get_desktop_state`,
-`open_code_editor`, `create_file`, `edit_file`, `run_bash`,
+`open_code_editor`, `create_file`, `edit_file`, `open_file`, `run_bash`,
 `close_code_editor`). The main realtimechat server knows nothing about any
 of this; it just forwards tool calls to whoever registered them.
 

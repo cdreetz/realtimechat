@@ -485,6 +485,25 @@ const toolHandlers = {
       ? `Replaced the first of ${r.occurrences} occurrences in ${r.path}.`
       : `Edited ${r.path}.`;
   },
+  async open_file({ editor_id, path }) {
+    const ed = getEditor(editor_id);
+    if (!ed) return `error: no code editor with id ${editor_id}`;
+    const full = normPath(path);
+    let r;
+    try {
+      r = await api("GET",
+        `/api/sandbox/${ed.sandboxId}/file?path=${encodeURIComponent(full)}`);
+    } catch (e) {
+      return `error: cannot open ${full}: ${e.message}`;
+    }
+    ed.files[full] = r.content;
+    if (ed.win.minimized) ed.win.restore();
+    ed.win.el.style.zIndex = ++zTop;
+    showFile(ed, full);
+    refreshTree(ed);
+    feed("tool", `→ showing ${full} in editor ${editor_id}`);
+    return `Now showing ${full} (${r.content.length} chars) in editor ${editor_id}.`;
+  },
   async run_bash({ editor_id, command }) {
     const ed = getEditor(editor_id);
     if (!ed) return `error: no code editor with id ${editor_id}`;
@@ -596,6 +615,13 @@ function toolSchemas() {
           new_string: { type: "string" } },
           required: ["editor_id", "path", "old_string", "new_string"] } } },
     { type: "function", function: {
+        name: "open_file",
+        description: "Show a file in a code editor's viewer so the user can see it. Use it to switch which file is displayed, or after changes the user should look at.",
+        parameters: { type: "object", properties: {
+          editor_id: { type: "integer" },
+          path: { type: "string" } },
+          required: ["editor_id", "path"] } } },
+    { type: "function", function: {
         name: "run_bash",
         description: "Run a bash command in a code editor's sandbox (workdir /workspace, 30s timeout). Returns exit code and output.",
         parameters: { type: "object", properties: {
@@ -619,7 +645,8 @@ const INSTRUCTIONS =
   "open_code_editor, then create_file / edit_file / run_bash against its " +
   "editor_id to write and run code (e.g. python script.py). The user watches " +
   "the editor and terminal, so never read code or long output aloud — " +
-  "describe results in a sentence. " +
+  "describe results in a sentence, and use open_file to put the file the " +
+  "user should look at on screen (only the currently shown file is visible). " +
   "'The top' means y=0 keeping x, 'top right corner' means the window flush " +
   "with that corner, etc. Call get_desktop_state when you need current window " +
   "positions/sizes or the desktop bounds to compute coordinates.";
