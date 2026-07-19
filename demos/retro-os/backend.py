@@ -177,6 +177,19 @@ async def read_file(sid: str, path: str) -> str:
     return out
 
 
+@app.get("/api/sandbox/{sid}/tree")
+async def file_tree(sid: str):
+    sid = pool.require(sid)
+    rc, out, _ = await sh(
+        "docker", "exec", sid, "sh", "-c",
+        f"cd {WORKDIR} && find . -type f "
+        "-not -path '*/node_modules/*' -not -path '*/.git/*' "
+        "-not -path '*/__pycache__/*' -not -path '*/.venv/*' "
+        "| sed 's|^\\./||' | sort | head -300")
+    files = [f for f in out.splitlines() if f.strip()] if rc == 0 else []
+    return {"files": files}
+
+
 @app.get("/api/sandbox/{sid}/file")
 async def file_read(sid: str, path: str):
     sid = pool.require(sid)

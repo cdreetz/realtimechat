@@ -52,14 +52,22 @@
 
   /* --- code editor --- */
   .ed-toolbar { display: flex; gap: 6px; padding: 3px 4px; align-items: center; }
-  .ed-toolbar select {
-    font: 11px Tahoma, sans-serif; background: #fff; min-width: 160px;
+  .ed-toolbar .curfile { font-weight: bold; font-size: 11px; }
+  .ed-toolbar .sbx { font-size: 10px; color: #444; margin-left: auto; }
+  .ed-main { flex: 1.4; display: flex; gap: 3px; min-height: 0; }
+  .ed-tree {
+    width: 150px; overflow: auto; background: #fff; padding: 3px 0;
+    font: 11px Tahoma, sans-serif;
     border-top: 2px solid #808080; border-left: 2px solid #808080;
     border-right: 2px solid #fff; border-bottom: 2px solid #fff;
   }
-  .ed-toolbar .sbx { font-size: 10px; color: #444; margin-left: auto; }
+  .ed-tree .titem { padding: 1px 6px; white-space: nowrap; cursor: default; }
+  .ed-tree .titem.file { cursor: pointer; }
+  .ed-tree .titem.file:hover { background: #d0d8e8; }
+  .ed-tree .titem.sel { background: #000080; color: #fff; }
+  .ed-tree .empty { color: #888; padding: 3px 6px; font-style: italic; }
   .ed-code {
-    flex: 1.4; resize: none; outline: none; border: 0; padding: 4px;
+    flex: 1; resize: none; outline: none; border: 0; padding: 4px;
     font: 12px "Courier New", monospace; background: #fff; color: #000;
     border-top: 2px solid #808080; border-left: 2px solid #808080;
     border-right: 2px solid #fff; border-bottom: 2px solid #fff;
@@ -299,24 +307,83 @@ function openEditorWindow(id, sandboxId) {
   });
   const bar = document.createElement("div");
   bar.className = "ed-toolbar";
-  const sel = document.createElement("select");
-  sel.innerHTML = "<option>(no files yet)</option>";
+  const curfile = document.createElement("span");
+  curfile.className = "curfile";
+  curfile.textContent = "(no file open)";
   const sbx = document.createElement("span");
   sbx.className = "sbx";
   sbx.textContent = `sandbox: ${sandboxId.replace("retrovoice-sbx-", "")}`;
-  bar.append(sel, sbx);
+  bar.append(curfile, sbx);
+  const main = document.createElement("div");
+  main.className = "ed-main";
+  const tree = document.createElement("div");
+  tree.className = "ed-tree";
+  tree.innerHTML = '<div class="empty">(no files yet)</div>';
   const code = document.createElement("textarea");
   code.className = "ed-code";
   code.readOnly = true; code.spellcheck = false;
+  main.append(tree, code);
   const term = document.createElement("div");
   term.className = "ed-term";
   term.textContent = "sandbox ready — python:3.11-slim, workdir /workspace\n";
-  win.body.append(bar, code, term);
+  win.body.append(bar, main, term);
 
-  const ed = { win, sel, code, term, sandboxId, files: {}, current: null };
-  sel.addEventListener("change", () => showFile(ed, sel.value));
+  const ed = { win, curfile, tree, code, term, sandboxId,
+               files: {}, knownFiles: [], current: null };
   editors[id] = ed;
   return ed;
+}
+
+async function refreshTree(ed) {
+  try {
+    const r = await api("GET", `/api/sandbox/${ed.sandboxId}/tree`);
+    ed.knownFiles = r.files;
+    renderTree(ed);
+  } catch (e) { /* sandbox may be gone */ }
+}
+
+function renderTree(ed) {
+  ed.tree.innerHTML = "";
+  if (!ed.knownFiles.length) {
+    ed.tree.innerHTML = '<div class="empty">(no files yet)</div>';
+    return;
+  }
+  const seenDirs = new Set();
+  for (const rel of ed.knownFiles) {
+    const parts = rel.split("/");
+    for (let d = 0; d < parts.length - 1; d++) {
+      const dir = parts.slice(0, d + 1).join("/");
+      if (seenDirs.has(dir)) continue;
+      seenDirs.add(dir);
+      const div = document.createElement("div");
+      div.className = "titem";
+      div.style.paddingLeft = 6 + d * 12 + "px";
+      div.textContent = `📁 ${parts[d]}`;
+      ed.tree.appendChild(div);
+    }
+    const div = document.createElement("div");
+    const full = "/workspace/" + rel;
+    div.className = "titem file" + (ed.current === full ? " sel" : "");
+    div.style.paddingLeft = 6 + (parts.length - 1) * 12 + "px";
+    div.textContent = `📄 ${parts[parts.length - 1]}`;
+    div.title = rel;
+    div.addEventListener("click", () => openFileInViewer(ed, full));
+    ed.tree.appendChild(div);
+  }
+}
+
+async function openFileInViewer(ed, full) {
+  if (!(full in ed.files)) {
+    try {
+      const r = await api("GET",
+        `/api/sandbox/${ed.sandboxId}/file?path=${encodeURIComponent(full)}`);
+      ed.files[full] = r.content;
+    } catch (e) {
+      termLine(ed, `cannot open ${full}: ${e.message}`);
+      return;
+    }
+  }
+  showFile(ed, full);
 }
 
 function normPath(p) {
@@ -326,12 +393,17 @@ function normPath(p) {
 function showFile(ed, path) {
   if (!(path in ed.files)) return;
   ed.current = path;
-  ed.sel.innerHTML = Object.keys(ed.files).map(p =>
-    `<option ${p === path ? "selected" : ""}>${p}</option>`).join("");
+  ed.curfile.textContent = path.replace("/workspace/", "");
   ed.code.value = ed.files[path];
+  renderTree(ed);
 }
 function setFile(ed, path, content) {
   ed.files[path] = content;
+  const rel = path.replace("/workspace/", "");
+  if (!ed.knownFiles.includes(rel)) {
+    ed.knownFiles.push(rel);
+    ed.knownFiles.sort();
+  }
   showFile(ed, path);
 }
 function termLine(ed, text, cls) {
@@ -422,6 +494,10 @@ const toolHandlers = {
                         { command: String(command) });
     if (r.output) termLine(ed, r.output);
     termLine(ed, `(exit ${r.exit_code})`, r.exit_code === 0 ? "" : "cmd");
+    // commands can create/modify files: refresh tree, refetch current view
+    const cur = ed.current;
+    ed.files = {};
+    refreshTree(ed).then(() => { if (cur) openFileInViewer(ed, cur); });
     return `exit code ${r.exit_code}\n${r.output.slice(0, 4000) || "(no output)"}`;
   },
   async close_code_editor({ editor_id }) {
@@ -450,7 +526,7 @@ const toolHandlers = {
     const nps = Object.entries(notepads).map(([id, np]) =>
       winInfo(np.win, { notepad_id: Number(id), chars: np.ta.value.length }));
     const eds = Object.entries(editors).map(([id, ed]) =>
-      winInfo(ed.win, { editor_id: Number(id), files: Object.keys(ed.files) }));
+      winInfo(ed.win, { editor_id: Number(id), files: ed.knownFiles }));
     feed("tool", `→ reported desktop state (${nps.length} notepad(s), ${eds.length} editor(s))`);
     return JSON.stringify({
       desktop: { width: desktop.clientWidth, height: desktop.clientHeight },
