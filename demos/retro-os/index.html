@@ -153,7 +153,7 @@ setInterval(() => {
 }, 1000);
 
 // ================= retro window manager =================
-function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
+function makeWindow({ title, icon, x, y, w, h, onMinimize, onClose }) {
   const win = document.createElement("div");
   win.className = "win";
   Object.assign(win.style, { left: x + "px", top: y + "px",
@@ -164,6 +164,12 @@ function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
   const minBtn = document.createElement("div");
   minBtn.className = "tbtn"; minBtn.textContent = "_";
   bar.appendChild(minBtn);
+  let closeBtn = null;
+  if (onClose) {
+    closeBtn = document.createElement("div");
+    closeBtn.className = "tbtn"; closeBtn.textContent = "✕";
+    bar.appendChild(closeBtn);
+  }
   const body = document.createElement("div");
   body.className = "winbody";
   win.append(bar, body);
@@ -171,7 +177,7 @@ function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
 
   win.addEventListener("mousedown", () => { win.style.zIndex = ++zTop; });
   bar.addEventListener("mousedown", e => {
-    if (e.target === minBtn) return;
+    if (e.target === minBtn || e.target === closeBtn) return;
     const ox = e.clientX - win.offsetLeft, oy = e.clientY - win.offsetTop;
     const move = ev => {
       win.style.left = Math.max(0, ev.clientX - ox) + "px";
@@ -183,8 +189,13 @@ function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
     document.addEventListener("mouseup", up);
   });
   minBtn.addEventListener("click", () => onMinimize ? onMinimize() : minimize());
+  if (closeBtn) closeBtn.addEventListener("click", () => { close(); onClose(); });
 
   let taskBtn = null;
+  function close() {
+    if (taskBtn) { taskBtn.remove(); taskBtn = null; }
+    win.remove();
+  }
   function minimize() {
     if (win.style.display === "none") return "already minimized";
     win.style.display = "none";
@@ -200,7 +211,7 @@ function makeWindow({ title, icon, x, y, w, h, onMinimize }) {
     win.style.zIndex = ++zTop;
     if (taskBtn) { taskBtn.remove(); taskBtn = null; }
   }
-  return { el: win, body, minimize, restore,
+  return { el: win, body, minimize, restore, close,
            get minimized() { return win.style.display === "none"; } };
 }
 
@@ -215,6 +226,7 @@ function openNotepad() {
     title: `Untitled ${id} - Notepad`, icon: "📝",
     x: 24 + ((id - 1) % 5) * 32, y: 24 + ((id - 1) % 5) * 28,
     w: Math.round(W / 2), h: Math.round(H / 2),
+    onClose: () => { delete notepads[id]; feed("tool", `→ closed notepad ${id}`); },
   });
   const menu = document.createElement("div");
   menu.className = "menubar";
@@ -268,6 +280,29 @@ const toolHandlers = {
     feed("tool", `→ minimized notepad ${notepad_id}`);
     return `Notepad ${notepad_id}: ${r}.`;
   },
+  close_notepad({ notepad_id }) {
+    const np = getNotepad(notepad_id);
+    if (!np) return `error: no notepad with id ${notepad_id}`;
+    np.win.close();
+    delete notepads[Number(notepad_id)];
+    feed("tool", `→ closed notepad ${notepad_id}`);
+    return `Closed notepad ${notepad_id}.`;
+  },
+  get_desktop_state() {
+    const wins = Object.entries(notepads).map(([id, np]) => ({
+      notepad_id: Number(id),
+      x: np.win.el.offsetLeft, y: np.win.el.offsetTop,
+      width: np.win.el.offsetWidth, height: np.win.el.offsetHeight,
+      minimized: np.win.minimized,
+      chars: np.ta.value.length,
+    }));
+    feed("tool", `→ reported desktop state (${wins.length} notepad(s))`);
+    return JSON.stringify({
+      desktop: { width: desktop.clientWidth, height: desktop.clientHeight },
+      note: "a window at (x,y) with size (w,h) fits while x <= desktop.width - w and y <= desktop.height - h",
+      notepads: wins,
+    });
+  },
 };
 
 function toolSchemas() {
@@ -297,6 +332,16 @@ function toolSchemas() {
         parameters: { type: "object", properties: {
           notepad_id: { type: "integer" } },
           required: ["notepad_id"] } } },
+    { type: "function", function: {
+        name: "close_notepad",
+        description: "Close a notepad window permanently (its contents are lost).",
+        parameters: { type: "object", properties: {
+          notepad_id: { type: "integer" } },
+          required: ["notepad_id"] } } },
+    { type: "function", function: {
+        name: "get_desktop_state",
+        description: "Get the current desktop dimensions and the position, size, and state of every open notepad. Use this to compute valid coordinates before moving windows.",
+        parameters: { type: "object", properties: {} } } },
   ];
 }
 
@@ -305,8 +350,8 @@ const INSTRUCTIONS =
   "looking at. Use the notepad tools to do what the user asks (open notepads, " +
   "write notes, move or minimize them) and confirm briefly in speech. " +
   "'The top' means y=0 keeping x, 'top right corner' means the window flush " +
-  "with that corner, etc. Compute coordinates yourself from the desktop size " +
-  "in the tool descriptions and the window size (quarter desktop).";
+  "with that corner, etc. Call get_desktop_state when you need current window " +
+  "positions/sizes or the desktop bounds to compute coordinates.";
 
 // ================= assistant window + feed =================
 let assistantWin, feedEl, statusEl;
