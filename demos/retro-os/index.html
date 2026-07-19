@@ -421,8 +421,41 @@ function termLine(ed, text, cls) {
 }
 
 // ================= client tools =================
+// App registry: adding an app type here gives it open_window support and
+// all generic window management for free.
+const APPS = {
+  notepad: {
+    blurb: "a text notepad for the user's notes (write to it with write_note)",
+    async open() {
+      const id = openNotepad();
+      return [id, `Opened a notepad, window_id ${id} ` +
+        `(${Math.round(desktop.clientWidth / 2)}x${Math.round(desktop.clientHeight / 2)} px, top-left area).`];
+    },
+  },
+  code_editor: {
+    blurb: "a code editor backed by a fresh Linux sandbox (Debian, Python 3.11, " +
+           "bash, network; files under /workspace) — use create_file, edit_file, " +
+           "open_file, run_bash with its window_id",
+    async open() {
+      const r = await api("POST", "/api/sandbox");
+      const id = nextWindowId++;
+      openEditorWindow(id, r.sandbox_id);
+      return [id, `Opened a code editor, window_id ${id}, backed by a fresh ` +
+        `Linux sandbox (Debian, Python 3.11, bash; no files yet). Files live under /workspace.`];
+    },
+  },
+};
+
 const toolHandlers = {
   // ---- generic window management (any window) ----
+  async open_window({ app_type }) {
+    const app = APPS[String(app_type)];
+    if (!app)
+      return `error: unknown app_type "${app_type}"; available: ${Object.keys(APPS).join(", ")}`;
+    const [id, msg] = await app.open();
+    feed("tool", `→ opened ${app_type} (window ${id})`);
+    return msg;
+  },
   get_desktop_state() {
     const list = Object.values(windows).map(w => {
       const info = {
@@ -498,12 +531,6 @@ const toolHandlers = {
   },
 
   // ---- notepads ----
-  open_notepad() {
-    const id = openNotepad();
-    feed("tool", `→ opened notepad ${id}`);
-    return `Opened a notepad, window_id ${id} ` +
-           `(${Math.round(desktop.clientWidth / 2)}x${Math.round(desktop.clientHeight / 2)} px, top-left area).`;
-  },
   write_note({ window_id, note_to_write }) {
     const [w, err] = requireWindow(window_id, "notepad");
     if (err) return err;
@@ -515,14 +542,6 @@ const toolHandlers = {
   },
 
   // ---- code editors ----
-  async open_code_editor() {
-    const r = await api("POST", "/api/sandbox");
-    const id = nextWindowId++;
-    openEditorWindow(id, r.sandbox_id);
-    feed("tool", `→ opened code editor ${id}`);
-    return `Opened a code editor, window_id ${id}, backed by a fresh Linux ` +
-           `sandbox (Debian, Python 3.11, bash; no files yet). Files live under /workspace.`;
-  },
   async create_file({ window_id, path, content }) {
     const [ed, err] = requireWindow(window_id, "code_editor");
     if (err) return err;
@@ -625,11 +644,14 @@ function toolSchemas() {
         description: "Close any window permanently. Notepad contents are lost; a code editor's sandbox and files are destroyed.",
         parameters: { type: "object", properties: { ...winId },
           required: ["window_id"] } } },
-    // notepads
+    // apps
     { type: "function", function: {
-        name: "open_notepad",
-        description: "Open a new notepad window (quarter desktop size). Returns its window_id.",
-        parameters: { type: "object", properties: {} } } },
+        name: "open_window",
+        description: "Open a new window of the given app type. Returns its window_id. Available app types: " +
+          Object.entries(APPS).map(([k, a]) => `${k} — ${a.blurb}`).join("; ") + ".",
+        parameters: { type: "object", properties: {
+          app_type: { type: "string", enum: Object.keys(APPS) } },
+          required: ["app_type"] } } },
     { type: "function", function: {
         name: "write_note",
         description: "Append a note to a notepad window.",
@@ -637,10 +659,6 @@ function toolSchemas() {
           note_to_write: { type: "string" } },
           required: ["window_id", "note_to_write"] } } },
     // code editors
-    { type: "function", function: {
-        name: "open_code_editor",
-        description: "Open a code editor window backed by a fresh Linux sandbox (Debian, Python 3.11, bash, network). Returns its window_id.",
-        parameters: { type: "object", properties: {} } } },
     { type: "function", function: {
         name: "create_file",
         description: "Create or overwrite a file in a code editor's sandbox. Paths relative to /workspace.",
@@ -671,12 +689,13 @@ function toolSchemas() {
 
 const INSTRUCTIONS =
   "You are the voice assistant of RetroVoice OS, a retro desktop the user " +
-  "is looking at. Every window — notepads, code editors, and your own " +
-  "Assistant.exe window — has a window_id; get_desktop_state lists them " +
-  "all with positions and sizes. The generic window tools (move_window, " +
-  "resize_window, minimize_window, restore_window, close_window) work on " +
-  "any window. 'The top' means y=0 keeping x; 'top right corner' means " +
-  "flush with that corner; compute coordinates from get_desktop_state. " +
+  "is looking at. Open apps with open_window(app_type); every window — " +
+  "notepads, code editors, and your own Assistant.exe window — has a " +
+  "window_id; get_desktop_state lists them all with positions and sizes. " +
+  "The generic window tools (move_window, resize_window, minimize_window, " +
+  "restore_window, close_window) work on any window. 'The top' means y=0 " +
+  "keeping x; 'top right corner' means flush with that corner; compute " +
+  "coordinates from get_desktop_state. " +
   "Notepads hold the user's notes via write_note. Code editors are real " +
   "Linux sandboxes: create_file / edit_file / run_bash to write and run " +
   "code. The user watches the editor and terminal, so never read code or " +

@@ -9,9 +9,9 @@ the speech server over the websocket. Every window shares one id space, so
 window management is generic — `move_window`, `resize_window`,
 `minimize_window`, `restore_window`, `close_window`, and
 `get_desktop_state` work on notepads, code editors, and the assistant
-window alike — while app tools cover app behavior: `open_notepad` /
-`write_note` and `open_code_editor` / `create_file` / `edit_file` /
-`open_file` / `run_bash`. The main realtimechat server knows nothing about
+window alike — while `open_window(app_type)` opens any app (an app registry
+maps types to windows) and app tools cover app behavior: `write_note`,
+`create_file` / `edit_file` / `open_file` / `run_bash`. The main realtimechat server knows nothing about
 any of this; it just forwards tool calls to whoever registered them.
 
 `backend.py` serves the page and manages the sandboxes, keeping a warm pool
