@@ -5,11 +5,14 @@ notepads, write notes, move/minimize/close windows, or open a **code
 editor** — a real Docker sandbox (python:3.11-slim) where it can create
 files, edit them, and run bash, with the editor and terminal visible on the
 desktop. All of it happens via client-side tools this page registers with
-the speech server over the websocket (`open_notepad`, `write_note`,
-`move_notepad`, `min_notepad`, `close_notepad`, `get_desktop_state`,
-`open_code_editor`, `create_file`, `edit_file`, `open_file`, `run_bash`,
-`close_code_editor`). The main realtimechat server knows nothing about any
-of this; it just forwards tool calls to whoever registered them.
+the speech server over the websocket. Every window shares one id space, so
+window management is generic — `move_window`, `resize_window`,
+`minimize_window`, `restore_window`, `close_window`, and
+`get_desktop_state` work on notepads, code editors, and the assistant
+window alike — while app tools cover app behavior: `open_notepad` /
+`write_note` and `open_code_editor` / `create_file` / `edit_file` /
+`open_file` / `run_bash`. The main realtimechat server knows nothing about
+any of this; it just forwards tool calls to whoever registered them.
 
 `backend.py` serves the page and manages the sandboxes, keeping a warm pool
 of 2 containers so opening an editor is instant. Sandboxes are capped

@@ -247,18 +247,30 @@ function makeWindow({ title, icon, x, y, w, h, onMinimize, onClose }) {
            get minimized() { return win.style.display === "none"; } };
 }
 
-// ================= notepads =================
-const notepads = {};
-let nextNotepadId = 1;
+// ================= window registry =================
+// Every window (notepad, code editor, assistant) lives here under one id
+// space; generic window tools operate on any of them.
+const windows = {};
+let nextWindowId = 1;
 
+function getWindow(id) { return windows[Number(id)] || null; }
+function requireWindow(id, kind) {
+  const w = getWindow(id);
+  if (!w) return [null, `error: no window with window_id ${id}`];
+  if (kind && w.kind !== kind)
+    return [null, `error: window ${id} is a ${w.kind}, not a ${kind}`];
+  return [w, null];
+}
+
+// ================= notepads =================
 function openNotepad() {
-  const id = nextNotepadId++;
+  const id = nextWindowId++;
   const W = desktop.clientWidth, H = desktop.clientHeight;
   const win = makeWindow({
     title: `Untitled ${id} - Notepad`, icon: "📝",
     x: 24 + ((id - 1) % 5) * 32, y: 24 + ((id - 1) % 5) * 28,
     w: Math.round(W / 2), h: Math.round(H / 2),
-    onClose: () => { delete notepads[id]; feed("tool", `→ closed notepad ${id}`); },
+    onClose: () => { delete windows[id]; feed("tool", `→ closed notepad ${id}`); },
   });
   const menu = document.createElement("div");
   menu.className = "menubar";
@@ -267,18 +279,11 @@ function openNotepad() {
   ta.className = "notepad-text";
   ta.spellcheck = false;
   win.body.append(menu, ta);
-  notepads[id] = { win, ta };
+  windows[id] = { id, kind: "notepad", title: `Notepad ${id}`, win, ta };
   return id;
 }
 
-function getNotepad(id) {
-  return notepads[Number(id)] || null;
-}
-
 // ================= code editors (docker sandboxes via backend) =================
-const editors = {};
-let nextEditorId = 1;
-
 async function api(method, url, body) {
   const r = await fetch(url, {
     method,
@@ -301,7 +306,7 @@ function openEditorWindow(id, sandboxId) {
     w: Math.round(W * 0.55), h: Math.round(H * 0.68),
     onClose: () => {
       fetch(`/api/sandbox/${sandboxId}`, { method: "DELETE" }).catch(() => {});
-      delete editors[id];
+      delete windows[id];
       feed("tool", `→ closed code editor ${id}`);
     },
   });
@@ -328,9 +333,10 @@ function openEditorWindow(id, sandboxId) {
   term.textContent = "sandbox ready — python:3.11-slim, workdir /workspace\n";
   win.body.append(bar, main, term);
 
-  const ed = { win, curfile, tree, code, term, sandboxId,
+  const ed = { id, kind: "code_editor", title: `Code Editor ${id}`,
+               win, curfile, tree, code, term, sandboxId,
                files: {}, knownFiles: [], current: null };
-  editors[id] = ed;
+  windows[id] = ed;
   return ed;
 }
 
@@ -413,81 +419,139 @@ function termLine(ed, text, cls) {
   ed.term.appendChild(s);
   ed.term.scrollTop = ed.term.scrollHeight;
 }
-function getEditor(id) { return editors[Number(id)] || null; }
 
 // ================= client tools =================
 const toolHandlers = {
+  // ---- generic window management (any window) ----
+  get_desktop_state() {
+    const list = Object.values(windows).map(w => {
+      const info = {
+        window_id: w.id, kind: w.kind, title: w.title,
+        x: w.win.el.offsetLeft, y: w.win.el.offsetTop,
+        width: w.win.el.offsetWidth, height: w.win.el.offsetHeight,
+        minimized: w.win.minimized,
+      };
+      if (w.kind === "notepad") info.chars = w.ta.value.length;
+      if (w.kind === "code_editor") info.files = w.knownFiles;
+      return info;
+    });
+    feed("tool", `→ reported desktop state (${list.length} window(s))`);
+    return JSON.stringify({
+      desktop: { width: desktop.clientWidth, height: desktop.clientHeight },
+      note: "a window at (x,y) with size (w,h) fits while x <= desktop.width - w and y <= desktop.height - h",
+      windows: list,
+    });
+  },
+  move_window({ window_id, x, y }) {
+    const [w, err] = requireWindow(window_id);
+    if (err) return err;
+    if (w.win.minimized) w.win.restore();
+    const maxX = Math.max(0, desktop.clientWidth - w.win.el.offsetWidth);
+    const maxY = Math.max(0, desktop.clientHeight - w.win.el.offsetHeight);
+    const nx = Math.min(Math.max(0, Math.round(Number(x))), maxX);
+    const ny = Math.min(Math.max(0, Math.round(Number(y))), maxY);
+    w.win.el.style.left = nx + "px";
+    w.win.el.style.top = ny + "px";
+    w.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ moved window ${w.id} to (${nx}, ${ny})`);
+    return `Moved ${w.title} so its top-left corner is at (${nx}, ${ny}).`;
+  },
+  resize_window({ window_id, width, height }) {
+    const [w, err] = requireWindow(window_id);
+    if (err) return err;
+    if (w.win.minimized) w.win.restore();
+    const nw = Math.min(Math.max(180, Math.round(Number(width))), desktop.clientWidth);
+    const nh = Math.min(Math.max(100, Math.round(Number(height))), desktop.clientHeight);
+    w.win.el.style.width = nw + "px";
+    w.win.el.style.height = nh + "px";
+    w.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ resized window ${w.id} to ${nw}x${nh}`);
+    return `Resized ${w.title} to ${nw}x${nh} px.`;
+  },
+  minimize_window({ window_id }) {
+    const [w, err] = requireWindow(window_id);
+    if (err) return err;
+    const r = w.win.minimize();
+    feed("tool", `→ minimized window ${w.id}`);
+    return `${w.title}: ${r}.`;
+  },
+  restore_window({ window_id }) {
+    const [w, err] = requireWindow(window_id);
+    if (err) return err;
+    w.win.restore();
+    w.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ restored window ${w.id}`);
+    return `${w.title} restored.`;
+  },
+  close_window({ window_id }) {
+    const [w, err] = requireWindow(window_id);
+    if (err) return err;
+    if (w.kind === "assistant")
+      return "error: the assistant window cannot be closed";
+    if (w.kind === "code_editor")
+      fetch(`/api/sandbox/${w.sandboxId}`, { method: "DELETE" }).catch(() => {});
+    w.win.close();
+    delete windows[w.id];
+    feed("tool", `→ closed window ${w.id}`);
+    return `Closed ${w.title}` +
+           (w.kind === "code_editor" ? " and destroyed its sandbox." : ".");
+  },
+
+  // ---- notepads ----
   open_notepad() {
     const id = openNotepad();
     feed("tool", `→ opened notepad ${id}`);
-    return `Opened notepad with notepad_id ${id}. It is ${Math.round(desktop.clientWidth / 2)}x${Math.round(desktop.clientHeight / 2)} px at the top-left area of the desktop.`;
+    return `Opened a notepad, window_id ${id} ` +
+           `(${Math.round(desktop.clientWidth / 2)}x${Math.round(desktop.clientHeight / 2)} px, top-left area).`;
   },
-  write_note({ notepad_id, note_to_write }) {
-    const np = getNotepad(notepad_id);
-    if (!np) return `error: no notepad with id ${notepad_id}`;
-    if (np.win.minimized) np.win.restore();
-    np.ta.value += (np.ta.value ? "\n" : "") + String(note_to_write ?? "");
-    np.ta.scrollTop = np.ta.scrollHeight;
-    feed("tool", `→ wrote to notepad ${notepad_id}`);
-    return `Wrote the note into notepad ${notepad_id}.`;
+  write_note({ window_id, note_to_write }) {
+    const [w, err] = requireWindow(window_id, "notepad");
+    if (err) return err;
+    if (w.win.minimized) w.win.restore();
+    w.ta.value += (w.ta.value ? "\n" : "") + String(note_to_write ?? "");
+    w.ta.scrollTop = w.ta.scrollHeight;
+    feed("tool", `→ wrote to notepad ${w.id}`);
+    return `Wrote the note into notepad ${w.id}.`;
   },
-  move_notepad({ notepad_id, x, y }) {
-    const np = getNotepad(notepad_id);
-    if (!np) return `error: no notepad with id ${notepad_id}`;
-    if (np.win.minimized) np.win.restore();
-    const maxX = Math.max(0, desktop.clientWidth - np.win.el.offsetWidth);
-    const maxY = Math.max(0, desktop.clientHeight - np.win.el.offsetHeight);
-    const nx = Math.min(Math.max(0, Math.round(Number(x))), maxX);
-    const ny = Math.min(Math.max(0, Math.round(Number(y))), maxY);
-    np.win.el.style.left = nx + "px";
-    np.win.el.style.top = ny + "px";
-    np.win.el.style.zIndex = ++zTop;
-    feed("tool", `→ moved notepad ${notepad_id} to (${nx}, ${ny})`);
-    return `Moved notepad ${notepad_id} so its top-left corner is at (${nx}, ${ny}).`;
-  },
-  min_notepad({ notepad_id }) {
-    const np = getNotepad(notepad_id);
-    if (!np) return `error: no notepad with id ${notepad_id}`;
-    const r = np.win.minimize();
-    feed("tool", `→ minimized notepad ${notepad_id}`);
-    return `Notepad ${notepad_id}: ${r}.`;
-  },
+
+  // ---- code editors ----
   async open_code_editor() {
     const r = await api("POST", "/api/sandbox");
-    const id = nextEditorId++;
+    const id = nextWindowId++;
     openEditorWindow(id, r.sandbox_id);
     feed("tool", `→ opened code editor ${id}`);
-    return `Opened code editor ${id} backed by a fresh Linux sandbox ` +
-           `(Debian, Python 3.11, bash; no files yet). Files live under /workspace.`;
+    return `Opened a code editor, window_id ${id}, backed by a fresh Linux ` +
+           `sandbox (Debian, Python 3.11, bash; no files yet). Files live under /workspace.`;
   },
-  async create_file({ editor_id, path, content }) {
-    const ed = getEditor(editor_id);
-    if (!ed) return `error: no code editor with id ${editor_id}`;
+  async create_file({ window_id, path, content }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
     const r = await api("POST", `/api/sandbox/${ed.sandboxId}/file`,
                         { path: String(path), content: String(content ?? "") });
     setFile(ed, r.path, String(content ?? ""));
     termLine(ed, `wrote ${r.path} (${r.bytes} bytes)`);
-    feed("tool", `→ created ${r.path} in editor ${editor_id}`);
+    feed("tool", `→ created ${r.path} in editor ${ed.id}`);
     return `Created ${r.path} (${r.bytes} bytes).`;
   },
-  async edit_file({ editor_id, path, old_string, new_string }) {
-    const ed = getEditor(editor_id);
-    if (!ed) return `error: no code editor with id ${editor_id}`;
+  async edit_file({ window_id, path, old_string, new_string }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
     const r = await api("PATCH", `/api/sandbox/${ed.sandboxId}/file`,
                         { path: String(path), old_string: String(old_string ?? ""),
                           new_string: String(new_string ?? "") });
     if (!r.replaced)
-      return `error: old_string not found in ${r.path}; file unchanged. Read it with run_bash (cat) or recreate it with create_file.`;
+      return `error: old_string not found in ${r.path}; file unchanged. ` +
+             `Read it with run_bash (cat) or recreate it with create_file.`;
     setFile(ed, r.path, r.content);
     termLine(ed, `edited ${r.path}`);
-    feed("tool", `→ edited ${r.path} in editor ${editor_id}`);
+    feed("tool", `→ edited ${r.path} in editor ${ed.id}`);
     return r.occurrences > 1
       ? `Replaced the first of ${r.occurrences} occurrences in ${r.path}.`
       : `Edited ${r.path}.`;
   },
-  async open_file({ editor_id, path }) {
-    const ed = getEditor(editor_id);
-    if (!ed) return `error: no code editor with id ${editor_id}`;
+  async open_file({ window_id, path }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
     const full = normPath(path);
     let r;
     try {
@@ -501,14 +565,14 @@ const toolHandlers = {
     ed.win.el.style.zIndex = ++zTop;
     showFile(ed, full);
     refreshTree(ed);
-    feed("tool", `→ showing ${full} in editor ${editor_id}`);
-    return `Now showing ${full} (${r.content.length} chars) in editor ${editor_id}.`;
+    feed("tool", `→ showing ${full} in editor ${ed.id}`);
+    return `Now showing ${full} (${r.content.length} chars) in editor ${ed.id}.`;
   },
-  async run_bash({ editor_id, command }) {
-    const ed = getEditor(editor_id);
-    if (!ed) return `error: no code editor with id ${editor_id}`;
+  async run_bash({ window_id, command }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
     termLine(ed, `$ ${command}`, "cmd");
-    feed("tool", `→ bash in editor ${editor_id}: ${String(command).slice(0, 80)}`);
+    feed("tool", `→ bash in editor ${ed.id}: ${String(command).slice(0, 80)}`);
     const r = await api("POST", `/api/sandbox/${ed.sandboxId}/exec`,
                         { command: String(command) });
     if (r.output) termLine(ed, r.output);
@@ -519,137 +583,101 @@ const toolHandlers = {
     refreshTree(ed).then(() => { if (cur) openFileInViewer(ed, cur); });
     return `exit code ${r.exit_code}\n${r.output.slice(0, 4000) || "(no output)"}`;
   },
-  async close_code_editor({ editor_id }) {
-    const ed = getEditor(editor_id);
-    if (!ed) return `error: no code editor with id ${editor_id}`;
-    ed.win.close();
-    await api("DELETE", `/api/sandbox/${ed.sandboxId}`).catch(() => {});
-    delete editors[Number(editor_id)];
-    feed("tool", `→ closed code editor ${editor_id}`);
-    return `Closed code editor ${editor_id} and destroyed its sandbox.`;
-  },
-  close_notepad({ notepad_id }) {
-    const np = getNotepad(notepad_id);
-    if (!np) return `error: no notepad with id ${notepad_id}`;
-    np.win.close();
-    delete notepads[Number(notepad_id)];
-    feed("tool", `→ closed notepad ${notepad_id}`);
-    return `Closed notepad ${notepad_id}.`;
-  },
-  get_desktop_state() {
-    const winInfo = (win, extra) => ({
-      x: win.el.offsetLeft, y: win.el.offsetTop,
-      width: win.el.offsetWidth, height: win.el.offsetHeight,
-      minimized: win.minimized, ...extra,
-    });
-    const nps = Object.entries(notepads).map(([id, np]) =>
-      winInfo(np.win, { notepad_id: Number(id), chars: np.ta.value.length }));
-    const eds = Object.entries(editors).map(([id, ed]) =>
-      winInfo(ed.win, { editor_id: Number(id), files: ed.knownFiles }));
-    feed("tool", `→ reported desktop state (${nps.length} notepad(s), ${eds.length} editor(s))`);
-    return JSON.stringify({
-      desktop: { width: desktop.clientWidth, height: desktop.clientHeight },
-      note: "a window at (x,y) with size (w,h) fits while x <= desktop.width - w and y <= desktop.height - h",
-      notepads: nps,
-      code_editors: eds,
-    });
-  },
 };
 
 function toolSchemas() {
-  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const winId = { window_id: { type: "integer", description: "Id from get_desktop_state or from opening the window." } };
   return [
+    // generic window management
+    { type: "function", function: {
+        name: "get_desktop_state",
+        description: "Get desktop dimensions and every open window (id, kind, title, position, size, minimized; notepad text length; code editor files). Use it to find windows and compute valid coordinates.",
+        parameters: { type: "object", properties: {} } } },
+    { type: "function", function: {
+        name: "move_window",
+        description: "Move any window's top-left corner to pixel coordinates. (0,0) is the desktop's top-left; x grows right, y grows down. Coordinates are clamped so the window stays on screen.",
+        parameters: { type: "object", properties: { ...winId,
+          x: { type: "integer" }, y: { type: "integer" } },
+          required: ["window_id", "x", "y"] } } },
+    { type: "function", function: {
+        name: "resize_window",
+        description: "Resize any window to width x height pixels (clamped to the desktop size).",
+        parameters: { type: "object", properties: { ...winId,
+          width: { type: "integer" }, height: { type: "integer" } },
+          required: ["window_id", "width", "height"] } } },
+    { type: "function", function: {
+        name: "minimize_window",
+        description: "Minimize any window to the taskbar.",
+        parameters: { type: "object", properties: { ...winId },
+          required: ["window_id"] } } },
+    { type: "function", function: {
+        name: "restore_window",
+        description: "Restore a minimized window and bring it to the front.",
+        parameters: { type: "object", properties: { ...winId },
+          required: ["window_id"] } } },
+    { type: "function", function: {
+        name: "close_window",
+        description: "Close any window permanently. Notepad contents are lost; a code editor's sandbox and files are destroyed.",
+        parameters: { type: "object", properties: { ...winId },
+          required: ["window_id"] } } },
+    // notepads
     { type: "function", function: {
         name: "open_notepad",
-        description: `Open a new notepad window on the desktop (it opens at quarter desktop size). Returns the new notepad_id.`,
+        description: "Open a new notepad window (quarter desktop size). Returns its window_id.",
         parameters: { type: "object", properties: {} } } },
     { type: "function", function: {
         name: "write_note",
-        description: "Append a note to an open notepad.",
-        parameters: { type: "object", properties: {
-          notepad_id: { type: "integer", description: "Id returned by open_notepad." },
-          note_to_write: { type: "string", description: "Text to write." } },
-          required: ["notepad_id", "note_to_write"] } } },
-    { type: "function", function: {
-        name: "move_notepad",
-        description: `Move a notepad window's top-left corner to pixel coordinates. The desktop is ${W}x${H} px; (0,0) is the top-left corner, x grows right, y grows down.`,
-        parameters: { type: "object", properties: {
-          notepad_id: { type: "integer" },
-          x: { type: "integer" }, y: { type: "integer" } },
-          required: ["notepad_id", "x", "y"] } } },
-    { type: "function", function: {
-        name: "min_notepad",
-        description: "Minimize a notepad window to the taskbar.",
-        parameters: { type: "object", properties: {
-          notepad_id: { type: "integer" } },
-          required: ["notepad_id"] } } },
-    { type: "function", function: {
-        name: "close_notepad",
-        description: "Close a notepad window permanently (its contents are lost).",
-        parameters: { type: "object", properties: {
-          notepad_id: { type: "integer" } },
-          required: ["notepad_id"] } } },
-    { type: "function", function: {
-        name: "get_desktop_state",
-        description: "Get the current desktop dimensions and the position, size, and state of every open window (notepads and code editors). Use this to compute valid coordinates before moving windows.",
-        parameters: { type: "object", properties: {} } } },
+        description: "Append a note to a notepad window.",
+        parameters: { type: "object", properties: { ...winId,
+          note_to_write: { type: "string" } },
+          required: ["window_id", "note_to_write"] } } },
+    // code editors
     { type: "function", function: {
         name: "open_code_editor",
-        description: "Open a code editor window backed by a fresh Linux sandbox (Debian, Python 3.11, bash, network access). Returns the editor_id. Use create_file/edit_file/run_bash with it.",
+        description: "Open a code editor window backed by a fresh Linux sandbox (Debian, Python 3.11, bash, network). Returns its window_id.",
         parameters: { type: "object", properties: {} } } },
     { type: "function", function: {
         name: "create_file",
-        description: "Create or overwrite a file in a code editor's sandbox. Paths are relative to /workspace.",
-        parameters: { type: "object", properties: {
-          editor_id: { type: "integer" },
-          path: { type: "string" },
-          content: { type: "string" } },
-          required: ["editor_id", "path", "content"] } } },
+        description: "Create or overwrite a file in a code editor's sandbox. Paths relative to /workspace.",
+        parameters: { type: "object", properties: { ...winId,
+          path: { type: "string" }, content: { type: "string" } },
+          required: ["window_id", "path", "content"] } } },
     { type: "function", function: {
         name: "edit_file",
         description: "Edit a file by replacing the first exact occurrence of old_string with new_string.",
-        parameters: { type: "object", properties: {
-          editor_id: { type: "integer" },
-          path: { type: "string" },
-          old_string: { type: "string" },
+        parameters: { type: "object", properties: { ...winId,
+          path: { type: "string" }, old_string: { type: "string" },
           new_string: { type: "string" } },
-          required: ["editor_id", "path", "old_string", "new_string"] } } },
+          required: ["window_id", "path", "old_string", "new_string"] } } },
     { type: "function", function: {
         name: "open_file",
-        description: "Show a file in a code editor's viewer so the user can see it. Use it to switch which file is displayed, or after changes the user should look at.",
-        parameters: { type: "object", properties: {
-          editor_id: { type: "integer" },
+        description: "Show a file in a code editor's viewer so the user can see it. Use it to switch which file is displayed.",
+        parameters: { type: "object", properties: { ...winId,
           path: { type: "string" } },
-          required: ["editor_id", "path"] } } },
+          required: ["window_id", "path"] } } },
     { type: "function", function: {
         name: "run_bash",
         description: "Run a bash command in a code editor's sandbox (workdir /workspace, 30s timeout). Returns exit code and output.",
-        parameters: { type: "object", properties: {
-          editor_id: { type: "integer" },
+        parameters: { type: "object", properties: { ...winId,
           command: { type: "string" } },
-          required: ["editor_id", "command"] } } },
-    { type: "function", function: {
-        name: "close_code_editor",
-        description: "Close a code editor window and destroy its sandbox (files are lost).",
-        parameters: { type: "object", properties: {
-          editor_id: { type: "integer" } },
-          required: ["editor_id"] } } },
+          required: ["window_id", "command"] } } },
   ];
 }
 
 const INSTRUCTIONS =
-  "You are the voice assistant of RetroVoice OS, a retro desktop the user is " +
-  "looking at. Use the notepad tools to do what the user asks (open notepads, " +
-  "write notes, move or minimize them) and confirm briefly in speech. " +
-  "Code editor windows are real Linux sandboxes: open one with " +
-  "open_code_editor, then create_file / edit_file / run_bash against its " +
-  "editor_id to write and run code (e.g. python script.py). The user watches " +
-  "the editor and terminal, so never read code or long output aloud — " +
-  "describe results in a sentence, and use open_file to put the file the " +
-  "user should look at on screen (only the currently shown file is visible). " +
-  "'The top' means y=0 keeping x, 'top right corner' means the window flush " +
-  "with that corner, etc. Call get_desktop_state when you need current window " +
-  "positions/sizes or the desktop bounds to compute coordinates.";
+  "You are the voice assistant of RetroVoice OS, a retro desktop the user " +
+  "is looking at. Every window — notepads, code editors, and your own " +
+  "Assistant.exe window — has a window_id; get_desktop_state lists them " +
+  "all with positions and sizes. The generic window tools (move_window, " +
+  "resize_window, minimize_window, restore_window, close_window) work on " +
+  "any window. 'The top' means y=0 keeping x; 'top right corner' means " +
+  "flush with that corner; compute coordinates from get_desktop_state. " +
+  "Notepads hold the user's notes via write_note. Code editors are real " +
+  "Linux sandboxes: create_file / edit_file / run_bash to write and run " +
+  "code. The user watches the editor and terminal, so never read code or " +
+  "long output aloud — describe results in a sentence and use open_file " +
+  "to put the file they should look at on screen (only the shown file is " +
+  "visible). Confirm actions briefly in speech.";
 
 // ================= assistant window + feed =================
 let assistantWin, feedEl, statusEl;
@@ -668,6 +696,8 @@ function buildAssistantWindow() {
   assistantWin.body.id = "assistant-body";
   assistantWin.el.id = "assistant";
   assistantWin.body.append(statusEl, feedEl);
+  const id = nextWindowId++;
+  windows[id] = { id, kind: "assistant", title: "Assistant.exe", win: assistantWin };
 }
 function feed(cls, text) {
   const d = document.createElement("div");
