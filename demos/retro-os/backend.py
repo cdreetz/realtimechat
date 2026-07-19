@@ -156,7 +156,8 @@ class ExecReq(BaseModel):
 
 @app.get("/")
 async def index():
-    return FileResponse(BASE_DIR / "index.html")
+    return FileResponse(BASE_DIR / "index.html",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/sandbox")
