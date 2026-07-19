@@ -50,6 +50,30 @@
     user-select: text;
   }
 
+  /* --- code editor --- */
+  .ed-toolbar { display: flex; gap: 6px; padding: 3px 4px; align-items: center; }
+  .ed-toolbar select {
+    font: 11px Tahoma, sans-serif; background: #fff; min-width: 160px;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  .ed-toolbar .sbx { font-size: 10px; color: #444; margin-left: auto; }
+  .ed-code {
+    flex: 1.4; resize: none; outline: none; border: 0; padding: 4px;
+    font: 12px "Courier New", monospace; background: #fff; color: #000;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+    white-space: pre; overflow: auto; user-select: text;
+  }
+  .ed-term {
+    flex: 1; overflow-y: auto; background: #000; color: #c7c7c7;
+    font: 11px "Courier New", monospace; padding: 4px 6px; margin-top: 3px;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+    white-space: pre-wrap; user-select: text;
+  }
+  .ed-term .cmd { color: #6fdc6f; }
+
   /* --- assistant window --- */
   #assistant .winbody { padding: 4px; gap: 4px; }
   #statusline {
@@ -243,6 +267,82 @@ function getNotepad(id) {
   return notepads[Number(id)] || null;
 }
 
+// ================= code editors (docker sandboxes via backend) =================
+const editors = {};
+let nextEditorId = 1;
+
+async function api(method, url, body) {
+  const r = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) {
+    let detail = r.statusText;
+    try { detail = (await r.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+function openEditorWindow(id, sandboxId) {
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const win = makeWindow({
+    title: `Code Editor ${id}`, icon: "💻",
+    x: 40 + ((id - 1) % 4) * 36, y: 30 + ((id - 1) % 4) * 30,
+    w: Math.round(W * 0.55), h: Math.round(H * 0.68),
+    onClose: () => {
+      fetch(`/api/sandbox/${sandboxId}`, { method: "DELETE" }).catch(() => {});
+      delete editors[id];
+      feed("tool", `→ closed code editor ${id}`);
+    },
+  });
+  const bar = document.createElement("div");
+  bar.className = "ed-toolbar";
+  const sel = document.createElement("select");
+  sel.innerHTML = "<option>(no files yet)</option>";
+  const sbx = document.createElement("span");
+  sbx.className = "sbx";
+  sbx.textContent = `sandbox: ${sandboxId.replace("retrovoice-sbx-", "")}`;
+  bar.append(sel, sbx);
+  const code = document.createElement("textarea");
+  code.className = "ed-code";
+  code.readOnly = true; code.spellcheck = false;
+  const term = document.createElement("div");
+  term.className = "ed-term";
+  term.textContent = "sandbox ready — python:3.11-slim, workdir /workspace\n";
+  win.body.append(bar, code, term);
+
+  const ed = { win, sel, code, term, sandboxId, files: {}, current: null };
+  sel.addEventListener("change", () => showFile(ed, sel.value));
+  editors[id] = ed;
+  return ed;
+}
+
+function normPath(p) {
+  p = String(p || "");
+  return p.startsWith("/") ? p : "/workspace/" + p;
+}
+function showFile(ed, path) {
+  if (!(path in ed.files)) return;
+  ed.current = path;
+  ed.sel.innerHTML = Object.keys(ed.files).map(p =>
+    `<option ${p === path ? "selected" : ""}>${p}</option>`).join("");
+  ed.code.value = ed.files[path];
+}
+function setFile(ed, path, content) {
+  ed.files[path] = content;
+  showFile(ed, path);
+}
+function termLine(ed, text, cls) {
+  const s = document.createElement("span");
+  if (cls) s.className = cls;
+  s.textContent = text + "\n";
+  ed.term.appendChild(s);
+  ed.term.scrollTop = ed.term.scrollHeight;
+}
+function getEditor(id) { return editors[Number(id)] || null; }
+
 // ================= client tools =================
 const toolHandlers = {
   open_notepad() {
@@ -280,6 +380,59 @@ const toolHandlers = {
     feed("tool", `→ minimized notepad ${notepad_id}`);
     return `Notepad ${notepad_id}: ${r}.`;
   },
+  async open_code_editor() {
+    const r = await api("POST", "/api/sandbox");
+    const id = nextEditorId++;
+    openEditorWindow(id, r.sandbox_id);
+    feed("tool", `→ opened code editor ${id}`);
+    return `Opened code editor ${id} backed by a fresh Linux sandbox ` +
+           `(Debian, Python 3.11, bash; no files yet). Files live under /workspace.`;
+  },
+  async create_file({ editor_id, path, content }) {
+    const ed = getEditor(editor_id);
+    if (!ed) return `error: no code editor with id ${editor_id}`;
+    const r = await api("POST", `/api/sandbox/${ed.sandboxId}/file`,
+                        { path: String(path), content: String(content ?? "") });
+    setFile(ed, r.path, String(content ?? ""));
+    termLine(ed, `wrote ${r.path} (${r.bytes} bytes)`);
+    feed("tool", `→ created ${r.path} in editor ${editor_id}`);
+    return `Created ${r.path} (${r.bytes} bytes).`;
+  },
+  async edit_file({ editor_id, path, old_string, new_string }) {
+    const ed = getEditor(editor_id);
+    if (!ed) return `error: no code editor with id ${editor_id}`;
+    const r = await api("PATCH", `/api/sandbox/${ed.sandboxId}/file`,
+                        { path: String(path), old_string: String(old_string ?? ""),
+                          new_string: String(new_string ?? "") });
+    if (!r.replaced)
+      return `error: old_string not found in ${r.path}; file unchanged. Read it with run_bash (cat) or recreate it with create_file.`;
+    setFile(ed, r.path, r.content);
+    termLine(ed, `edited ${r.path}`);
+    feed("tool", `→ edited ${r.path} in editor ${editor_id}`);
+    return r.occurrences > 1
+      ? `Replaced the first of ${r.occurrences} occurrences in ${r.path}.`
+      : `Edited ${r.path}.`;
+  },
+  async run_bash({ editor_id, command }) {
+    const ed = getEditor(editor_id);
+    if (!ed) return `error: no code editor with id ${editor_id}`;
+    termLine(ed, `$ ${command}`, "cmd");
+    feed("tool", `→ bash in editor ${editor_id}: ${String(command).slice(0, 80)}`);
+    const r = await api("POST", `/api/sandbox/${ed.sandboxId}/exec`,
+                        { command: String(command) });
+    if (r.output) termLine(ed, r.output);
+    termLine(ed, `(exit ${r.exit_code})`, r.exit_code === 0 ? "" : "cmd");
+    return `exit code ${r.exit_code}\n${r.output.slice(0, 4000) || "(no output)"}`;
+  },
+  async close_code_editor({ editor_id }) {
+    const ed = getEditor(editor_id);
+    if (!ed) return `error: no code editor with id ${editor_id}`;
+    ed.win.close();
+    await api("DELETE", `/api/sandbox/${ed.sandboxId}`).catch(() => {});
+    delete editors[Number(editor_id)];
+    feed("tool", `→ closed code editor ${editor_id}`);
+    return `Closed code editor ${editor_id} and destroyed its sandbox.`;
+  },
   close_notepad({ notepad_id }) {
     const np = getNotepad(notepad_id);
     if (!np) return `error: no notepad with id ${notepad_id}`;
@@ -289,18 +442,21 @@ const toolHandlers = {
     return `Closed notepad ${notepad_id}.`;
   },
   get_desktop_state() {
-    const wins = Object.entries(notepads).map(([id, np]) => ({
-      notepad_id: Number(id),
-      x: np.win.el.offsetLeft, y: np.win.el.offsetTop,
-      width: np.win.el.offsetWidth, height: np.win.el.offsetHeight,
-      minimized: np.win.minimized,
-      chars: np.ta.value.length,
-    }));
-    feed("tool", `→ reported desktop state (${wins.length} notepad(s))`);
+    const winInfo = (win, extra) => ({
+      x: win.el.offsetLeft, y: win.el.offsetTop,
+      width: win.el.offsetWidth, height: win.el.offsetHeight,
+      minimized: win.minimized, ...extra,
+    });
+    const nps = Object.entries(notepads).map(([id, np]) =>
+      winInfo(np.win, { notepad_id: Number(id), chars: np.ta.value.length }));
+    const eds = Object.entries(editors).map(([id, ed]) =>
+      winInfo(ed.win, { editor_id: Number(id), files: Object.keys(ed.files) }));
+    feed("tool", `→ reported desktop state (${nps.length} notepad(s), ${eds.length} editor(s))`);
     return JSON.stringify({
       desktop: { width: desktop.clientWidth, height: desktop.clientHeight },
       note: "a window at (x,y) with size (w,h) fits while x <= desktop.width - w and y <= desktop.height - h",
-      notepads: wins,
+      notepads: nps,
+      code_editors: eds,
     });
   },
 };
@@ -340,8 +496,42 @@ function toolSchemas() {
           required: ["notepad_id"] } } },
     { type: "function", function: {
         name: "get_desktop_state",
-        description: "Get the current desktop dimensions and the position, size, and state of every open notepad. Use this to compute valid coordinates before moving windows.",
+        description: "Get the current desktop dimensions and the position, size, and state of every open window (notepads and code editors). Use this to compute valid coordinates before moving windows.",
         parameters: { type: "object", properties: {} } } },
+    { type: "function", function: {
+        name: "open_code_editor",
+        description: "Open a code editor window backed by a fresh Linux sandbox (Debian, Python 3.11, bash, network access). Returns the editor_id. Use create_file/edit_file/run_bash with it.",
+        parameters: { type: "object", properties: {} } } },
+    { type: "function", function: {
+        name: "create_file",
+        description: "Create or overwrite a file in a code editor's sandbox. Paths are relative to /workspace.",
+        parameters: { type: "object", properties: {
+          editor_id: { type: "integer" },
+          path: { type: "string" },
+          content: { type: "string" } },
+          required: ["editor_id", "path", "content"] } } },
+    { type: "function", function: {
+        name: "edit_file",
+        description: "Edit a file by replacing the first exact occurrence of old_string with new_string.",
+        parameters: { type: "object", properties: {
+          editor_id: { type: "integer" },
+          path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" } },
+          required: ["editor_id", "path", "old_string", "new_string"] } } },
+    { type: "function", function: {
+        name: "run_bash",
+        description: "Run a bash command in a code editor's sandbox (workdir /workspace, 30s timeout). Returns exit code and output.",
+        parameters: { type: "object", properties: {
+          editor_id: { type: "integer" },
+          command: { type: "string" } },
+          required: ["editor_id", "command"] } } },
+    { type: "function", function: {
+        name: "close_code_editor",
+        description: "Close a code editor window and destroy its sandbox (files are lost).",
+        parameters: { type: "object", properties: {
+          editor_id: { type: "integer" } },
+          required: ["editor_id"] } } },
   ];
 }
 
@@ -349,6 +539,11 @@ const INSTRUCTIONS =
   "You are the voice assistant of RetroVoice OS, a retro desktop the user is " +
   "looking at. Use the notepad tools to do what the user asks (open notepads, " +
   "write notes, move or minimize them) and confirm briefly in speech. " +
+  "Code editor windows are real Linux sandboxes: open one with " +
+  "open_code_editor, then create_file / edit_file / run_bash against its " +
+  "editor_id to write and run code (e.g. python script.py). The user watches " +
+  "the editor and terminal, so never read code or long output aloud — " +
+  "describe results in a sentence. " +
   "'The top' means y=0 keeping x, 'top right corner' means the window flush " +
   "with that corner, etc. Call get_desktop_state when you need current window " +
   "positions/sizes or the desktop bounds to compute coordinates.";
@@ -508,15 +703,17 @@ function handle(m) {
       thinking = true;
       feed("tool", `⚙ ${m.name}(${(m.args || "").slice(0, 120)})`);
       if (m.call_id && toolHandlers[m.name]) {
-        let result;
-        try {
-          const args = m.args ? JSON.parse(m.args) : {};
-          result = String(toolHandlers[m.name](args));
-        } catch (err) {
-          result = `error: ${err.message}`;
-        }
-        ws.send(JSON.stringify({ type: "tool_result",
-                                 call_id: m.call_id, result }));
+        (async () => {
+          let result;
+          try {
+            const args = m.args ? JSON.parse(m.args) : {};
+            result = String(await toolHandlers[m.name](args));
+          } catch (err) {
+            result = `error: ${err.message}`;
+          }
+          ws.send(JSON.stringify({ type: "tool_result",
+                                   call_id: m.call_id, result }));
+        })();
       }
       break;
     }
