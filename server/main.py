@@ -159,12 +159,13 @@ class VadGate:
     """
 
     def __init__(self, model, pre_roll_s=0.4, start_prob=0.6, end_prob=0.35,
-                 min_speech_s=0.25, pause_silence_s=0.35, end_silence_s=2.4,
-                 max_utterance_s=45.0):
+                 min_speech_s=0.25, early_silence_s=0.15, pause_silence_s=0.35,
+                 end_silence_s=2.4, max_utterance_s=45.0):
         self.model = model
         self.start_prob = start_prob
         self.end_prob = end_prob
         self.min_speech_frames = int(min_speech_s * MIC_SR / VAD_FRAME)
+        self.early_frames = int(early_silence_s * MIC_SR / VAD_FRAME)
         self.pause_frames = int(pause_silence_s * MIC_SR / VAD_FRAME)
         self.end_silence_frames = int(end_silence_s * MIC_SR / VAD_FRAME)
         self.max_utterance_frames = int(max_utterance_s * MIC_SR / VAD_FRAME)
@@ -217,6 +218,12 @@ class VadGate:
                     events.append(("resume", None))
                 self.silence_run = 0
 
+            # head start for ASR: transcription can begin 200ms before the
+            # pause event fires, so the transcript is ready at the pause
+            if (self.silence_run == self.early_frames
+                    and self.speech_frames >= self.min_speech_frames):
+                events.append(("early", np.concatenate(self.utterance)))
+
             if (not self.pause_emitted
                     and self.silence_run == self.pause_frames
                     and self.speech_frames >= self.min_speech_frames):
@@ -246,6 +253,7 @@ class Session:
         self.utt = 0
         self.response_task = None
         self.eval_task = None
+        self.early = None          # (gen, asr_task) started at the early event
         self.gate_gen = 0          # bumped on start/resume; stale evals discard
         self.pause_transcript = None  # (gen, text) reusable at hard end
         self.client_tools = []        # tool schemas registered by the client
@@ -325,6 +333,14 @@ class Session:
     def cancel_eval(self):
         if self.eval_task and not self.eval_task.done():
             self.eval_task.cancel()
+        if self.early and not self.early[1].done():
+            self.early[1].cancel()
+        self.early = None
+
+    async def transcribe_async(self, audio: np.ndarray) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.server.asr_executor, self.server.transcribe, audio)
 
     async def on_audio(self, pcm: np.ndarray):
         for event, audio in self.gate.feed(pcm):
@@ -339,6 +355,9 @@ class Session:
                 self.gate_gen += 1
                 self.cancel_eval()
                 await self.send({"type": "vad", "data": "resume"})
+            elif event == "early":
+                self.early = (self.gate_gen,
+                              asyncio.create_task(self.transcribe_async(audio)))
             elif event == "pause":
                 await self.send({"type": "vad", "data": "pause"})
                 self.eval_task = asyncio.create_task(
@@ -350,11 +369,20 @@ class Session:
                     asyncio.create_task(self.finalize_turn(audio))
 
     async def evaluate_pause(self, audio: np.ndarray, gen: int):
-        """Short pause: transcribe and judge whether the turn is complete."""
+        """Short pause: judge whether the turn is complete, with two overlaps:
+        the transcript usually comes from the early-ASR head start, and while
+        the LLM verdict is pending the response is generated speculatively
+        (held, not sent) so a DONE verdict costs no extra latency."""
         t0 = time.monotonic()
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(
-            self.server.asr_executor, self.server.transcribe, audio)
+        early = self.early
+        if early and early[0] == gen and not early[1].cancelled():
+            try:
+                text = await early[1]
+            except asyncio.CancelledError:
+                return
+        else:
+            text = await self.transcribe_async(audio)
+        self.early = None
         if gen != self.gate_gen:
             return  # user resumed while we transcribed
         norm = text.lower().strip(" .,!?")
@@ -362,10 +390,17 @@ class Session:
             return  # noise; let the hard end handle it
         verdict = turn_heuristic(text)
         source = "heuristic"
+        spec = hold = None
         if verdict is None:
+            hold = asyncio.Event()
+            self.cancel_response()
+            spec = asyncio.create_task(self.respond(text, t0, audio, hold=hold))
+            self.response_task = spec
             verdict = await self.classify_turn(text)
-            source = "llm"
+            source = "llm+spec"
         if gen != self.gate_gen:
+            if spec:
+                spec.cancel()
             return
         ms = (time.monotonic() - t0) * 1000
         self.log.info(f"endpoint {verdict} ({source}, {ms:.0f}ms): {text!r}")
@@ -374,8 +409,18 @@ class Session:
         if verdict == "done":
             self.gate.force_reset()
             self.gate_gen += 1
-            await self.start_turn(text, t0, audio)
+            self.pause_transcript = None
+            self.log.info(f"turn: {text!r}")
+            await self.send({"type": "transcription", "data": text})
+            if spec:
+                hold.set()
+            else:
+                self.cancel_response()
+                self.response_task = asyncio.create_task(
+                    self.respond(text, t0, audio))
         else:
+            if spec:
+                spec.cancel()
             self.pause_transcript = (gen, text)
 
     async def classify_turn(self, text: str) -> str:
@@ -422,10 +467,25 @@ class Session:
         self.cancel_response()
         self.response_task = asyncio.create_task(self.respond(text, t0, audio))
 
-    async def respond(self, user_text: str, t0: float, audio: np.ndarray = None):
+    async def respond(self, user_text: str, t0: float, audio: np.ndarray = None,
+                      hold: asyncio.Event = None):
+        """Generate and stream a response. With `hold`, generation runs
+        speculatively: nothing is sent to the client or committed to history
+        until the event is set (cancellation before that leaves no trace)."""
         self.utt += 1
         utt = self.utt
-        self.history.append({"role": "user", "content": user_text})
+        user_msg = {"role": "user", "content": user_text}
+        released = hold is None
+        if released:
+            self.history.append(user_msg)
+
+        async def release():
+            nonlocal released
+            if not released:
+                await hold.wait()
+                self.history.append(user_msg)
+                released = True
+
         spoken = []
         first_token_ms = first_audio_ms = None
         try:
@@ -440,7 +500,8 @@ class Session:
                 self.log.warning(f"history trimmed: dropped {dropped} of "
                                  f"{len(self.history)} messages")
                 await self.send({"type": "history_trimmed", "dropped": dropped})
-            messages = [{"role": "system", "content": system}] + hist
+            messages = ([{"role": "system", "content": system}] + hist
+                        + ([user_msg] if hold is not None else []))
             kwargs = dict(
                 model=self.server.llm_model,
                 stream=True,
@@ -469,6 +530,7 @@ class Session:
 
             async def flush_speak(text):
                 nonlocal first_audio_ms
+                await release()
                 if await self.speak(text, utt, len(spoken)):
                     if first_audio_ms is None:
                         first_audio_ms = (time.monotonic() - t0) * 1000
@@ -520,6 +582,7 @@ class Session:
                 if not tool_calls:
                     break
 
+                await release()  # tools have visible effects; never run held
                 # Speak any buffered pre-tool phrase ("Let me check…") so the
                 # user hears something while tools run.
                 if buf.strip():
@@ -559,6 +622,7 @@ class Session:
 
             if buf.strip():
                 await flush_speak(buf.strip())
+            await release()
 
             full = full.strip()
             self.history.append({"role": "assistant", "content": full or "(no reply)"})
@@ -644,6 +708,12 @@ class SpeechServer:
             device=self.device,
         )
 
+        logger.info("warming up Whisper...")
+        try:
+            self.transcribe(np.zeros(MIC_SR, dtype=np.float32))
+        except Exception as e:
+            logger.warning(f"whisper warmup failed: {e}")
+
         logger.info("loading Kokoro TTS...")
         from kokoro import KPipeline
         self.tts = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M",
@@ -675,6 +745,17 @@ class SpeechServer:
     def wants_no_thinking(self, model: str) -> bool:
         """Local Qwen hybrid-thinking models need enable_thinking=False."""
         return model is not None and "qwen" in model.lower()
+
+    async def prewarm_llm(self):
+        """Tiny request per connection: warms the HTTP connection and any
+        lazy server state so the first real turn doesn't pay for it."""
+        try:
+            await self.llm.chat.completions.create(
+                model=self.llm_model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1, temperature=0.0)
+        except Exception as e:
+            logger.debug(f"llm prewarm failed: {e}")
 
     async def wait_for_llm(self):
         if self.llm_model is None:
@@ -736,6 +817,7 @@ class SpeechServer:
             self.session_counter += 1
             session = Session(self, ws, self.session_counter)
             logger.info(f"session {session.id} connected")
+            asyncio.create_task(self.prewarm_llm())
             await session.send({
                 "type": "ready",
                 "llm_model": self.llm_model,

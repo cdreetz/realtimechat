@@ -29,7 +29,8 @@ local machine                          GPU box (server/)
 sudo docker run -d --name chatllm --restart unless-stopped --gpus '"device=0"' \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 127.0.0.1:8001:8000 --ipc=host vllm/vllm-openai:v0.19.0 \
-  --model Qwen/Qwen3.5-35B-A3B --max-model-len 8192 --gpu-memory-utilization 0.85
+  --model Qwen/Qwen3.5-35B-A3B --max-model-len 32768 --gpu-memory-utilization 0.85 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml
 
 # speech server (Whisper + Kokoro go on the second GPU if present)
 sudo apt-get install -y espeak-ng
@@ -108,3 +109,82 @@ transcription, reply, and returned audio, and prints latency numbers.
   are forwarded to the client for execution (see `demos/retro-os/`)
 - `old/` — the previous generation of this project (blocking pipeline,
   WebRTC experiment, manual Kokoro setup); kept for reference, not used
+
+## Toward Jarvis: roadmap
+
+Ideas for making the assistant feel instant, controllable, and vivid.
+Numbered for reference; ✅ = done.
+
+1. **Async agent + sub-agents** — long tool work (installs, builds) runs as
+   background jobs while the conversation stays live; worker agents grind on
+   big tasks and report back; completions surface proactively.
+2. **Reflex + cortex model split** — fast local model answers instantly and
+   handles simple turns; big remote model engaged for depth. Pre-synthesized
+   instant acks ("Sure.") mask remaining think time.
+3. ✅ **Speculative everything** — see below.
+4. **Real STOP + undo** — "stop" kills playback, generation, and in-flight
+   tools within ~100ms; undo stack for window ops and file edits; an
+   always-answerable "what are you doing?".
+5. **Voice-speed confirmation** — dangerous actions get a one-word approval
+   flow instead of silent execution.
+6. ✅ **"Show me" windows** — see below.
+7. **Ambient context** — a compact desktop snapshot (windows, shown file,
+   recent terminal) attached to every turn so "fix that" resolves without a
+   lookup.
+8. **Cross-session memory** — distilled facts and project state persisted
+   and injected into future sessions.
+9. **Reliability** — tunnel keep-alive or move ASR/TTS local to the laptop;
+   supervisor + health chip in the UI. Long-game: fine-tune a small local
+   model on this system's own tool-use traces (reflex layer handles ~90% of
+   turns alone).
+
+### Done: #3 speculative everything (server)
+
+Three overlaps, all in `server/main.py`:
+
+- **Early ASR**: transcription starts at 150ms of trailing silence — 200ms
+  before the endpointing pause fires at 350ms — so the transcript is ready
+  when the turn decision starts.
+- **Speculative generation**: when the turn-complete verdict needs the LLM
+  classifier, the response starts generating in parallel under a hold gate —
+  nothing is sent or committed to history until DONE releases it; WAIT or
+  resumed speech cancels it without a trace. Tool execution is never
+  speculated (visible side effects).
+- **Prewarm**: Whisper's first-call CUDA cost is paid at boot; each new
+  session fires a 1-token LLM request to warm the connection.
+
+Measured (local Qwen3.5-35B-A3B, e2e test with realtime-paced audio): the
+LLM's first token now lands **together with** the endpoint verdict ~285ms
+after the pause instead of after it (serialized it would be ~565ms — the
+speculation refunds ~280ms), the early ASR hides another ~200ms of
+transcription, and text turns hit **83–87ms first token** (prewarmed; the
+first-turn penalty of ~250ms is gone). Net: last word → first audio ≈
+**0.85s** (0.35s endpoint patience + ~0.5s pipeline), and turns that end
+unambiguously (e.g. questions) skip the classifier entirely.
+
+### Done: #6 "show me" windows (demo)
+
+Two new code-editor verbs in `demos/retro-os`, both windows fully managed by
+the generic window tools:
+
+- **`show_image(window_id, path)`** — displays any image file from the
+  sandbox in a retro viewer window (backend `/raw` endpoint serves sandbox
+  file bytes with the right mimetype). Re-calling with the same path
+  refreshes in place — save a chart, show it, regenerate, show again.
+- **`open_preview(window_id, path?)`** — live browser (iframe) window
+  pointed at whatever web server runs on **port 8000 inside the sandbox**;
+  each sandbox's port 8000 is published to an ephemeral localhost port at
+  container creation. The agent can build a FastAPI app, run it, and put the
+  actual live page on your screen.
+
+Verified end-to-end: PNG created in a sandbox renders through `/raw`
+(image/png), and a server on sandbox port 8000 is reachable through the
+published port. The model's instructions now say "show, don't tell."
+
+### Model note (Jul 2026)
+
+Default is back to the **local Qwen3.5-35B-A3B** (vLLM, GPU 0) — first
+token ~285ms vs Inkling's ~1.8–2.3s (reasoning + WAN), and current tasks
+don't need the extra depth. The vLLM container now runs with 32k context so
+the 20k-token history budget fits. Inkling stays one relaunch away (see
+"Using a different LLM backend") for when Tinker ships native audio input.

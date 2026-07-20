@@ -82,6 +82,25 @@
   }
   .ed-term .cmd { color: #6fdc6f; }
 
+  /* --- viewers --- */
+  .imgwrap {
+    flex: 1; overflow: auto; display: flex; align-items: center;
+    justify-content: center; background: #fff;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  .imgwrap img { max-width: 100%; max-height: 100%; }
+  .prev-bar { display: flex; gap: 5px; padding: 3px 4px; align-items: center; }
+  .prev-bar .url {
+    flex: 1; background: #fff; padding: 2px 6px; font-size: 11px;
+    overflow: hidden; white-space: nowrap;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff;
+  }
+  .prev-frame { flex: 1; border: 0; background: #fff;
+    border-top: 2px solid #808080; border-left: 2px solid #808080;
+    border-right: 2px solid #fff; border-bottom: 2px solid #fff; }
+
   /* --- assistant window --- */
   #assistant .winbody { padding: 4px; gap: 4px; }
   #statusline {
@@ -446,6 +465,51 @@ const APPS = {
   },
 };
 
+// ---- viewer windows (image + web preview), created by editor verbs ----
+function openImageViewer(rel) {
+  const id = nextWindowId++;
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const win = makeWindow({
+    title: `${rel} - Viewer`, icon: "🖼️",
+    x: Math.round(W * 0.3), y: Math.round(H * 0.08),
+    w: Math.round(W * 0.5), h: Math.round(H * 0.62),
+    onClose: () => { delete windows[id]; },
+  });
+  const wrap = document.createElement("div");
+  wrap.className = "imgwrap";
+  const img = document.createElement("img");
+  wrap.appendChild(img);
+  win.body.append(wrap);
+  const v = { id, kind: "image_viewer", title: `Viewer: ${rel}`, win, img };
+  windows[id] = v;
+  return v;
+}
+
+function openPreviewWindow() {
+  const id = nextWindowId++;
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const win = makeWindow({
+    title: "Web Preview", icon: "🌐",
+    x: Math.round(W * 0.25), y: Math.round(H * 0.06),
+    w: Math.round(W * 0.55), h: Math.round(H * 0.72),
+    onClose: () => { delete windows[id]; },
+  });
+  const bar = document.createElement("div");
+  bar.className = "prev-bar";
+  const url = document.createElement("span");
+  url.className = "url";
+  const reload = document.createElement("button");
+  reload.textContent = "↻";
+  const frame = document.createElement("iframe");
+  frame.className = "prev-frame";
+  reload.addEventListener("click", () => { frame.src = frame.src; });
+  bar.append(url, reload);
+  win.body.append(bar, frame);
+  const v = { id, kind: "preview", title: "Web Preview", win, frame, url };
+  windows[id] = v;
+  return v;
+}
+
 const toolHandlers = {
   // ---- generic window management (any window) ----
   async open_window({ app_type }) {
@@ -587,6 +651,48 @@ const toolHandlers = {
     feed("tool", `→ showing ${full} in editor ${ed.id}`);
     return `Now showing ${full} (${r.content.length} chars) in editor ${ed.id}.`;
   },
+  async show_image({ window_id, path }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
+    const full = normPath(path);
+    const rel = full.replace("/workspace/", "");
+    const url = `/api/sandbox/${ed.sandboxId}/raw?path=${encodeURIComponent(full)}&t=${Date.now()}`;
+    let v = Object.values(windows).find(
+      w => w.kind === "image_viewer" && w.src === full && w.sandboxId === ed.sandboxId);
+    if (!v) {
+      v = openImageViewer(rel);
+      v.src = full;
+      v.sandboxId = ed.sandboxId;
+    }
+    v.img.src = url;
+    if (v.win.minimized) v.win.restore();
+    v.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ showing image ${rel} (window ${v.id})`);
+    return `Showing ${full} in an image viewer, window_id ${v.id}. It refreshes each time you call show_image on the same path.`;
+  },
+  async open_preview({ window_id, path }) {
+    const [ed, err] = requireWindow(window_id, "code_editor");
+    if (err) return err;
+    let port;
+    try {
+      port = (await api("GET", `/api/sandbox/${ed.sandboxId}/port`)).host_port;
+    } catch (e) {
+      return `error: ${e.message}`;
+    }
+    const target = `http://127.0.0.1:${port}${path ? String(path) : "/"}`;
+    let v = Object.values(windows).find(
+      w => w.kind === "preview" && w.sandboxId === ed.sandboxId);
+    if (!v) {
+      v = openPreviewWindow();
+      v.sandboxId = ed.sandboxId;
+    }
+    v.frame.src = target;
+    v.url.textContent = target;
+    if (v.win.minimized) v.win.restore();
+    v.win.el.style.zIndex = ++zTop;
+    feed("tool", `→ preview of ${target} (window ${v.id})`);
+    return `Opened a live preview, window_id ${v.id}, showing ${target} — the sandbox's port 8000 mapped to the host. A server must be listening on port 8000 inside the sandbox or the page will fail to load.`;
+  },
   async run_bash({ window_id, command }) {
     const [ed, err] = requireWindow(window_id, "code_editor");
     if (err) return err;
@@ -684,6 +790,18 @@ function toolSchemas() {
         parameters: { type: "object", properties: { ...winId,
           command: { type: "string" } },
           required: ["window_id", "command"] } } },
+    { type: "function", function: {
+        name: "show_image",
+        description: "Display an image file from a code editor's sandbox (png/jpg/gif/svg) in a viewer window the user can see. Save charts/plots as files, then show them with this. Calling again with the same path refreshes the viewer.",
+        parameters: { type: "object", properties: { ...winId,
+          path: { type: "string", description: "Image path in the sandbox." } },
+          required: ["window_id", "path"] } } },
+    { type: "function", function: {
+        name: "open_preview",
+        description: "Open a live browser preview of a web server running on port 8000 inside a code editor's sandbox (start one first, e.g. uvicorn main:app --host 0.0.0.0 --port 8000). Optional path selects the page. Calling again refreshes/navigates.",
+        parameters: { type: "object", properties: { ...winId,
+          path: { type: "string", description: "Optional URL path, e.g. /docs" } },
+          required: ["window_id"] } } },
   ];
 }
 
@@ -701,7 +819,10 @@ const INSTRUCTIONS =
   "code. The user watches the editor and terminal, so never read code or " +
   "long output aloud — describe results in a sentence and use open_file " +
   "to put the file they should look at on screen (only the shown file is " +
-  "visible). Confirm actions briefly in speech.";
+  "visible). Show, don't tell: save charts/images as files and display " +
+  "them with show_image; for web apps, serve on port 8000 in the sandbox " +
+  "and call open_preview so the user sees the live page. " +
+  "Confirm actions briefly in speech.";
 
 // ================= assistant window + feed =================
 let assistantWin, feedEl, statusEl;

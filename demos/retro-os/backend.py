@@ -10,6 +10,7 @@ Run:  python backend.py   (needs Docker running; serves http://localhost:8080)
 """
 import asyncio
 import logging
+import mimetypes
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -32,7 +33,7 @@ MAX_OUTPUT = 8000
 BASE_DIR = Path(__file__).resolve().parent
 
 
-async def sh(*args, stdin: bytes = None, timeout: float = 120):
+async def sh_bytes(*args, stdin: bytes = None, timeout: float = 120):
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -43,7 +44,12 @@ async def sh(*args, stdin: bytes = None, timeout: float = 120):
     except asyncio.TimeoutError:
         proc.kill()
         raise HTTPException(504, "command timed out")
-    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+    return proc.returncode, out, err.decode(errors="replace")
+
+
+async def sh(*args, stdin: bytes = None, timeout: float = 120):
+    rc, out, err = await sh_bytes(*args, stdin=stdin, timeout=timeout)
+    return rc, out.decode(errors="replace"), err
 
 
 def safe_path(p: str) -> str:
@@ -88,6 +94,8 @@ class SandboxPool:
         rc, _, err = await sh(
             "docker", "run", "-d", "--rm", "--label", LABEL,
             "--memory", "1g", "--cpus", "2", "-w", WORKDIR,
+            # container port 8000 -> ephemeral host port, for app previews
+            "-p", "127.0.0.1:0:8000",
             "--name", name, IMAGE, "sleep", "infinity")
         if rc != 0:
             raise HTTPException(500, f"docker run failed: {err.strip()}")
@@ -176,6 +184,32 @@ async def read_file(sid: str, path: str) -> str:
     if rc != 0:
         raise HTTPException(404, err.strip() or f"cannot read {path}")
     return out
+
+
+@app.get("/api/sandbox/{sid}/port")
+async def sandbox_port(sid: str):
+    """Host port mapped to the sandbox's container port 8000 (for previews)."""
+    sid = pool.require(sid)
+    rc, out, _ = await sh("docker", "port", sid, "8000/tcp")
+    lines = [l for l in out.splitlines() if ":" in l]
+    if rc != 0 or not lines:
+        raise HTTPException(404, "sandbox has no published port")
+    return {"host_port": int(lines[0].rsplit(":", 1)[1])}
+
+
+@app.get("/api/sandbox/{sid}/raw")
+async def file_raw(sid: str, path: str):
+    """Raw file bytes with a guessed mimetype (images etc. for viewers)."""
+    sid = pool.require(sid)
+    p = safe_path(path)
+    rc, out, err = await sh_bytes("docker", "exec", sid, "cat", p)
+    if rc != 0:
+        raise HTTPException(404, err.strip() or f"cannot read {p}")
+    if len(out) > 20 * 1024 * 1024:
+        raise HTTPException(413, "file too large")
+    mime = mimetypes.guess_type(p)[0] or "application/octet-stream"
+    return Response(out, media_type=mime,
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/sandbox/{sid}/tree")

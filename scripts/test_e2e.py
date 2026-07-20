@@ -84,11 +84,12 @@ async def main():
                 "data": base64.b64encode(audio[i:i + chunk].tobytes()).decode()}))
             await asyncio.sleep(0.01)  # faster than realtime but paced
         silence = np.zeros(chunk, dtype=np.float32)
-        for _ in range(24):  # ~3 s of silence: covers the hard-end path too
+        for _ in range(24):  # ~3 s of trailing silence, paced at REALTIME so
+            # the pause/endpoint pipeline runs as it would with a live mic
             await ws.send(json.dumps({
                 "type": "audio",
                 "data": base64.b64encode(silence.tobytes()).decode()}))
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.128)
 
         t0 = time.monotonic()
         _, transcription, text, samples, done = await collect_response(ws)
