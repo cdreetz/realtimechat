@@ -112,6 +112,10 @@ transcription, reply, and returned audio, and prints latency numbers.
 
 ## Toward Jarvis: roadmap
 
+The active feature backlog and proposed delivery order are in
+[ROADMAP.md](ROADMAP.md), updated September 2026. The notes below preserve the
+earlier roadmap and measurements.
+
 Ideas for making the assistant feel instant, controllable, and vivid.
 Numbered for reference; ✅ = done.
 
@@ -188,3 +192,11 @@ token ~285ms vs Inkling's ~1.8–2.3s (reasoning + WAN), and current tasks
 don't need the extra depth. The vLLM container now runs with 32k context so
 the 20k-token history budget fits. Inkling stays one relaunch away (see
 "Using a different LLM backend") for when Tinker ships native audio input.
+
+
+## Training data collection
+
+RetroVoice now records audio and agent/app activity when the desktop starts, with
+visible pause/resume controls and explicit feedback buttons. Data is saved on the
+speech server. See [the collection guide](docs/DATA_COLLECTION.md) for the format,
+coverage, storage location, copying to the Mac, and integrity checks.

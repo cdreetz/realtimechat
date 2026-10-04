@@ -5,6 +5,15 @@ env/
 __pycache__/
 .DS_Store
 server.log
+.sandbox-backups/
+demos/retro-os/.sandboxes.json
+demos/retro-os/.browsers.json
+demos/retro-os/backend.log
 
 server/Kokoro-82M/
 models/
+data/recordings/
+demos/retro-os/.workspaces/
+
+# Local background worker journals
+demos/retro-os/.agents/

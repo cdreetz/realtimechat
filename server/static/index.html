@@ -102,6 +102,7 @@
   <button id="sendBtn" disabled>Send</button>
 </footer>
 
+<script src="/recording-client.js"></script>
 <script>
 const MIC_SR = 16000, TTS_SR = 24000;
 let ws = null, micCtx = null, playCtx = null, micStream = null;
@@ -111,6 +112,11 @@ let interruptedUtts = new Set(), curAssistantEl = null, curUtt = null;
 let micLevel = 0;
 
 const $ = id => document.getElementById(id);
+const training = new TrainingRecorder({socket: () => ws, key: "speech-record-training-v1",
+  metadata: () => ({app: "speech-chat", mic_settings: micStream?.getAudioTracks()[0]?.getSettings(),
+    mic_context_rate: micCtx?.sampleRate, user_agent: navigator.userAgent})});
+training.controls(document.querySelector("header"));
+setInterval(() => training.event("clock"), 2000);
 
 function log(cls, text) {
   const el = $("log");
@@ -158,20 +164,21 @@ function resample(f32, from, to) {
 }
 
 // ---- playback (gapless scheduling) ----
-function enqueueAudio(f32) {
+function enqueueAudio(f32, message) {
   const buf = playCtx.createBuffer(1, f32.length, TTS_SR);
   buf.copyToChannel(f32, 0);
   const src = playCtx.createBufferSource();
   src.buffer = buf;
   src.connect(playCtx.destination);
   const t = Math.max(playCtx.currentTime + 0.06, playhead);
+  training.playback(src, playCtx, t, f32.length, TTS_SR, {utt: message.utt, seq: message.seq});
   src.start(t);
   playhead = t + buf.duration;
   sources.push(src);
   if (sources.length > 64) sources = sources.filter(() => true).slice(-64);
 }
 function stopPlayback() {
-  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources.forEach(s => { s.traceStopped = true; s.traceStopTime = playCtx?.currentTime; try { s.stop(); } catch (e) {} });
   sources = [];
   playhead = 0;
 }
@@ -199,7 +206,7 @@ async function startMic() {
   srcNode.connect(worklet);
 
   let acc = [];
-  let accLen = 0;
+  let accLen = 0, captureSamples = 0, packetSeq = 0;
   const target = Math.round(micCtx.sampleRate * 0.128);
   worklet.port.onmessage = e => {
     const frame = e.data;
@@ -208,13 +215,18 @@ async function startMic() {
     micLevel = Math.max(micLevel * 0.9, Math.sqrt(sum / frame.length));
     acc.push(frame);
     accLen += frame.length;
-    if (accLen >= target && ws && ws.readyState === 1) {
+    if (accLen >= target) {
       const joined = new Float32Array(accLen);
       let off = 0;
       for (const f of acc) { joined.set(f, off); off += f.length; }
       acc = []; accLen = 0;
       const pcm = resample(joined, micCtx.sampleRate, MIC_SR);
-      ws.send(JSON.stringify({ type: "audio", data: b64FromFloat32(pcm) }));
+      const captureStart = captureSamples;
+      captureSamples += pcm.length;
+      const seq = packetSeq++;
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "audio", data: b64FromFloat32(pcm),
+        seq, capture_start_sample: captureStart, client_session_id: training.clientSessionId,
+        client_monotonic_ms: performance.now(), mic_context_s: micCtx.currentTime }));
     }
   };
   log("sys", `mic live (ctx ${micCtx.sampleRate} Hz, echo cancellation on)`);
@@ -225,12 +237,13 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen = () => log("sys", "websocket connected");
-  ws.onclose = () => { log("sys", "websocket closed"); setStatus(); };
+  ws.onclose = () => { training.disconnected(); log("sys", "websocket closed"); setStatus(); };
   ws.onerror = () => log("int", "websocket error");
   ws.onmessage = e => handleMessage(JSON.parse(e.data));
 }
 
 function handleMessage(m) {
+  training.handle(m);
   switch (m.type) {
     case "ready":
       $("modelInfo").textContent = m.llm_model;
@@ -282,7 +295,7 @@ function handleMessage(m) {
       if (interruptedUtts.has(m.utt)) break;
       if (m.pcm) {
         const f32 = f32FromB64(m.pcm);
-        enqueueAudio(f32);
+        enqueueAudio(f32, m);
         log("tts", `audio chunk ${m.seq} (${(f32.length / TTS_SR).toFixed(2)}s)`);
       } else if (m.final) {
         log("tts", "response audio complete");
@@ -295,6 +308,7 @@ function handleMessage(m) {
         t.className = "timing";
         t.textContent = `first token ${m.t_first_token_ms}ms · first audio ${m.t_first_audio_ms}ms`;
         curAssistantEl.appendChild(t);
+        training.feedback(curAssistantEl, {kind: "response", utt: m.utt});
       }
       curAssistantEl = null; curUtt = null;
       log("llm", `done · first token ${m.t_first_token_ms}ms · first audio ${m.t_first_audio_ms}ms`);
